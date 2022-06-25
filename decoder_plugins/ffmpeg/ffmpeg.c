@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include <errno.h>
 
+#include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/mathematics.h>
 #if HAVE_LIBAVUTIL_CHANNEL_LAYOUT_H
