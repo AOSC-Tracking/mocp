@@ -1172,7 +1172,7 @@ static bool seek_in_stream (struct ffmpeg_data *data)
 static bool seek_in_stream (struct ffmpeg_data *data, int sec)
 #endif
 {
-	int rc, flags = AVSEEK_FLAG_ANY;
+	int rc;
 	int64_t seek_ts;
 
 #if SEEK_IN_DECODER
@@ -1198,10 +1198,8 @@ static bool seek_in_stream (struct ffmpeg_data *data, int sec)
 		seek_ts += data->stream->start_time;
 	}
 
-	if (data->stream->cur_dts > seek_ts)
-		flags |= AVSEEK_FLAG_BACKWARD;
-
-	rc = av_seek_frame (data->ic, data->stream->index, seek_ts, flags);
+	rc = av_seek_frame (data->ic, data->stream->index, seek_ts,
+	                    AVSEEK_FLAG_BACKWARD);
 	if (rc < 0) {
 		log_errno ("Seek error", rc);
 		return false;
