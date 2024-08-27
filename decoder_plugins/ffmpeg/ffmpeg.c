@@ -993,8 +993,6 @@ static void *ffmpeg_open (const char *file)
 #endif
 
 	set_downmixing (data);
-	if (data->codec->capabilities & AV_CODEC_CAP_TRUNCATED)
-		data->enc->flags |= AV_CODEC_FLAG_TRUNCATED;
 
 #ifdef HAVE_AVCODEC_OPEN2
 	if (avcodec_open2 (data->enc, data->codec, NULL) < 0)
