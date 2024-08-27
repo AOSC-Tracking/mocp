@@ -16,6 +16,7 @@
 #include <assert.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -75,21 +76,27 @@ static unsigned int hash (const char * str)
  * If there is no such option return -1. */
 static int find_option (const char *name, enum option_type type)
 {
-	unsigned int h=hash(name),i,init_pos=h%OPTIONS_MAX;
+	unsigned int h = hash (name), i, init_pos = h % OPTIONS_MAX;
 
-	for(i=init_pos;i<OPTIONS_MAX;i++)
-		if(options[i].type==OPTION_FREE)
+	for (i = init_pos; i < OPTIONS_MAX; i += 1) {
+		if (options[i].type == OPTION_FREE)
 			return -1;
-		else if(h == options[i].hash && type & options[i].type)
-			if(!strcasecmp(name, options[i].name))
-		    	return i;
 
-	for(i=0;i<init_pos;i++)
-		if(options[i].type==OPTION_FREE)
+		if (h == options[i].hash && type & options[i].type) {
+			if (!strcasecmp (name, options[i].name))
+				return i;
+		}
+	}
+
+	for (i = 0; i < init_pos; i += 1) {
+		if (options[i].type == OPTION_FREE)
 			return -1;
-		else if(h == options[i].hash && type & options[i].type)
-			if(!strcasecmp(name, options[i].name))
+
+		if (h == options[i].hash && type & options[i].type) {
+			if (!strcasecmp (name, options[i].name))
 		    	return i;
+		}
+	}
 
 	return -1;
 }
@@ -101,15 +108,17 @@ static int find_free (unsigned int h)
 	unsigned int i;
 
 	assert (options_num < OPTIONS_MAX);
-	h%=OPTIONS_MAX;
+	h %= OPTIONS_MAX;
 
-	for(i=h;i<OPTIONS_MAX;i++)
-		if(options[i].type==OPTION_FREE)
+	for (i = h; i < OPTIONS_MAX; i += 1) {
+		if (options[i].type == OPTION_FREE)
 			return i;
+	}
 
-	for(i=0;i<h;i++)
-		if(options[i].type==OPTION_FREE)
+	for (i = 0; i < h; i += 1) {
+		if (options[i].type == OPTION_FREE)
 			return i;
+	}
 
 	return -1;
 }
@@ -262,7 +271,7 @@ static int check_function (int opt, ...)
 }
 
 /* Always pass a value as valid. */
-static int check_true (int opt ATTR_UNUSED, ...)
+static int check_true (int unused ATTR_UNUSED, ...)
 {
 	return 1;
 }
@@ -408,14 +417,11 @@ static void add_list (const char *name, const char *value, options_t_check *chec
 /* Set an integer option to the value. */
 void options_set_int (const char *name, const int value)
 {
-	int i = find_option (name, OPTION_INT | OPTION_BOOL);
+	int i = find_option (name, OPTION_INT);
 
 	if (i == -1)
 		fatal ("Tried to set wrong option '%s'!", name);
-	if (options[i].type == OPTION_INT)
-		options[i].value.num = value;
-	else
-		options[i].value.boolean = value ? true : false;
+	options[i].value.num = value;
 }
 
 /* Set a boolean option to the value. */
@@ -449,18 +455,14 @@ void options_set_symb (const char *name, const char *value)
 /* Set a string option to the value. The string is duplicated. */
 void options_set_str (const char *name, const char *value)
 {
-	int opt = find_option (name, OPTION_STR | OPTION_SYMB);
+	int opt = find_option (name, OPTION_STR);
 
 	if (opt == -1)
 		fatal ("Tried to set wrong option '%s'!", name);
 
-	if (options[opt].type == OPTION_SYMB) {
-		options_set_symb (name, value);
-	} else {
-		if (options[opt].value.str)
-			free (options[opt].value.str);
-		options[opt].value.str = xstrdup (value);
-	}
+	if (options[opt].value.str)
+		free (options[opt].value.str);
+	options[opt].value.str = xstrdup (value);
 }
 
 /* Set list option values to the colon separated value. */
@@ -557,6 +559,7 @@ void options_init ()
 	add_bool ("ReadTags", true);
 	add_str  ("MusicDir", NULL, CHECK_NONE);
 	add_bool ("StartInMusicDir", false);
+	add_int  ("CircularLogSize", 0, CHECK_RANGE(1), 0, INT_MAX);
 	add_symb ("Sort", "FileName", CHECK_SYMBOL(1), "FileName");
 	add_bool ("ShowStreamErrors", false);
 	add_bool ("MP3IgnoreCRCErrors", true);
@@ -655,10 +658,11 @@ void options_init ()
 	                 "wv(wavpack,*,ffmpeg):"
 	                 "audio/aac(aac):audio/aacp(aac):audio/m4a(ffmpeg):"
 	                 "audio/wav(sndfile,*):"
-	                 "ogg(vorbis,ffmpeg):oga(vorbis,ffmpeg):ogv(ffmpeg):"
+	                 "ogg(vorbis,*,ffmpeg):oga(vorbis,*,ffmpeg):ogv(ffmpeg):"
+	                 "application/ogg(vorbis):audio/ogg(vorbis):"
+	                 "flac(flac,*,ffmpeg):"
 	                 "opus(ffmpeg):"
-	                 "spx(speex):"
-	                 "application/ogg(vorbis):audio/ogg(vorbis)",
+	                 "spx(speex)",
 	                 CHECK_FUNCTION);
 
 	add_symb ("ResampleMethod", "Linear",
@@ -740,6 +744,8 @@ void options_init ()
 
 	add_str  ("OnSongChange", NULL, CHECK_NONE);
 	add_bool ("RepeatSongChange", false);
+	add_str  ("OnServerStart", NULL, CHECK_NONE);
+	add_str  ("OnServerStop", NULL, CHECK_NONE);
 	add_str  ("OnStop", NULL, CHECK_NONE);
 
 	add_bool ("QueueNextSongReturn", false);
@@ -777,7 +783,7 @@ int options_check_str (const char *name, const char *val)
 {
 	int opt;
 
-	opt = find_option (name, OPTION_STR | OPTION_SYMB);
+	opt = find_option (name, OPTION_STR);
 	if (opt == -1)
 		return 0;
 	return options[opt].check (opt, val);
@@ -837,14 +843,6 @@ int options_was_defaulted (const char *name)
 		result = 1;
 
 	return result;
-}
-
-static int is_deprecated_option (const char *name)
-{
-	if (!strcmp(name, "TagsIconv"))
-		return 1;
-
-	return 0;
 }
 
 /* Find and substitute variables enclosed by '${...}'.  Variables are
@@ -972,87 +970,15 @@ static char *substitute_variable (const char *name_in, const char *value_in)
 	return result;
 }
 
-/* Rewrite comma-separated SoundDriver value as a list value. */
-static char *rewrite_sounddriver_as_list (const char *str)
-{
-	char *result, *ptr;
-
-	ptr = result = xmalloc (strlen (str) + 1);
-
-	do {
-		if (*str == ',')
-			*ptr++ = ':';
-		else if (*ptr != ' ')
-			*ptr++ = *str;
-	} while (*str++);
-
-	return result;
-}
-
-/* Rewrite Layout string value as a function-valued list. */
-static char *rewrite_layout_as_list (const char *str)
-{
-	int len, size, ix;
-	char *result, *work;
-	lists_t_strs *layouts;
-
-	layouts = lists_strs_new (4);
-	work = xstrdup (str);
-	size = lists_strs_split (layouts, str, " ");
-	free (work);
-
-	for (ix = 0; ix < size; ix += 1) {
-		char *ptr;
-
-		ptr = strchr (lists_strs_at (layouts, ix), ':');
-		if (!ptr)
-			fatal ("Malformed layout option: %s", str);
-		*ptr = '(';
-	}
-
-	result = lists_strs_fmt (layouts, "%s):");
-	len = strlen (result);
-	result[len - 1] = 0x00;
-	lists_strs_free (layouts);
-
-	return result;
-}
-
 /* Set an option read from the configuration file. Return false on error. */
 static bool set_option (const char *name, const char *value_in, bool append)
 {
 	int i;
-	char *value, *value_s;
-	const char *name_s;
+	char *value;
 
-	if (is_deprecated_option (name)) {
-		fprintf (stderr, "\n\tOption '%s' was ignored;"
-		                 "\n\tplease remove it from your configuration file.\n", name);
-		sleep (5);
-		return true;
-	}
-
-	name_s = name;
-
-	/* Handle a change of option name for OSSMixerChannel. */
-	if (!strcasecmp (name, "OSSMixerChannel"))
-		name_s = "OSSMixerChannel1";
-
-	/* Handle a change of option name for ALSAMixer. */
-	if (!strcasecmp (name, "ALSAMixer"))
-		name_s = "ALSAMixer1";
-
-	/* Warn if configuration file needs updating. */
-	if (name != name_s) {
-		fprintf (stderr, "\n\tThe name of option '%s' has changed to '%s';"
-		                 "\n\tplease update your configuration file accordingly.\n\n",
-		                 name, name_s);
-		sleep (5);
-	}
-
-	i = find_option (name_s, OPTION_ANY);
+	i = find_option (name, OPTION_ANY);
 	if (i == -1) {
-		fprintf (stderr, "Wrong option name: '%s'.", name_s);
+		fprintf (stderr, "Wrong option name: '%s'.", name);
 		return false;
 	}
 
@@ -1062,72 +988,22 @@ static bool set_option (const char *name, const char *value_in, bool append)
 	if (append && options[i].type != OPTION_LIST) {
 		fprintf (stderr,
 		         "Only list valued options can be appended to ('%s').",
-		         name_s);
+		         name);
 		return false;
 	}
 
 	if (!append && options[i].set_in_config) {
 		fprintf (stderr, "Tried to set an option that has been already "
-		                 "set in the config file ('%s').", name_s);
+		                 "set in the config file ('%s').", name);
 		return false;
 	}
 
 	options[i].set_in_config = 1;
 
 	/* Substitute environmental variables. */
-	value_s = substitute_variable (name_s, value_in);
-	value = NULL;
+	value = substitute_variable (name, value_in);
 
-	/* Handle a change of option type for SidPlay2_StartAtStart. */
-	if (!strcasecmp (options[i].name, "SidPlay2_StartAtStart")) {
-		if (!strcmp (value_s, "0"))
-			value = xstrdup ("no");
-		else if (!strcmp (value_s, "1"))
-			value = xstrdup ("yes");
-	}
-
-	/* Handle a change of option type for SidPlay2_PlaySubTunes. */
-	if (!strcasecmp (options[i].name, "SidPlay2_PlaySubTunes")) {
-		if (!strcmp (value_s, "0"))
-			value = xstrdup ("no");
-		else if (!strcmp (value_s, "1"))
-			value = xstrdup ("yes");
-	}
-
-	/* Handle a change of option type for QueueNextSongReturn. */
-	if (!strcasecmp (options[i].name, "QueueNextSongReturn")) {
-		if (!strcmp (value_s, "0"))
-			value = xstrdup ("no");
-		else if (!strcmp (value_s, "1"))
-			value = xstrdup ("yes");
-	}
-
-	/* Handle a change of option type for SoundDriver. */
-	if (!strcasecmp (options[i].name, "SoundDriver")) {
-		if (strchr (value_s, ','))
-			value = rewrite_sounddriver_as_list (value_s);
-	}
-
-	/* Handle a change of option type for Layouts. */
-	if (!strncasecmp (options[i].name, "Layout", 6)) {
-		if (value_s[0] && !strchr (value_s, '('))
-			value = rewrite_layout_as_list (value_s);
-	}
-
-	/* Warn if configuration file needs updating. */
-	if (value) {
-		free (value_s);
-		fprintf (stderr, "\n\tThe valid values of '%s' have changed;"
-		                 "\n\tplease read the comments for this option in"
-		                 "\n\tthe supplied config.example file and update"
-		                 "\n\tyour own configuration file accordingly.\n\n",
-		                 name_s);
-		sleep (5);
-	}
-	else
-		value = value_s;
-
-	if (!options_set_pair (name_s, value, append))
+	if (!options_set_pair (name, value, append))
 		return false;
 
 	free (value);
@@ -1164,7 +1040,7 @@ void options_parse (const char *config_file)
 		fatal ("Configuration file is not secure: %s", config_file);
 
 	if (!(file = fopen(config_file, "r"))) {
-		logit ("Can't open config file: %s", strerror (errno));
+		log_errno ("Can't open config file", errno);
 		return;
 	}
 
@@ -1309,13 +1185,11 @@ void options_free ()
 
 int options_get_int (const char *name)
 {
-	int i = find_option (name, OPTION_INT | OPTION_BOOL);
+	int i = find_option (name, OPTION_INT);
 
 	if (i == -1)
 		fatal ("Tried to get wrong option '%s'!", name);
 
-	if (options[i].type == OPTION_BOOL)
-		return options[i].value.boolean ? 1 : 0;
 	return options[i].value.num;
 }
 
@@ -1331,7 +1205,7 @@ bool options_get_bool (const char *name)
 
 char *options_get_str (const char *name)
 {
-	int i = find_option (name, OPTION_STR | OPTION_SYMB);
+	int i = find_option (name, OPTION_STR);
 
 	if (i == -1)
 		fatal ("Tried to get wrong option '%s'!", name);
@@ -1349,7 +1223,7 @@ char *options_get_symb (const char *name)
 	return options[i].value.str;
 }
 
-struct lists_s_strs *options_get_list (const char *name)
+lists_t_strs *options_get_list (const char *name)
 {
 	int i = find_option (name, OPTION_LIST);
 

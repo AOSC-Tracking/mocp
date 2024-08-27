@@ -20,12 +20,6 @@
 # include "config.h"
 #endif
 
-/* for lrintf() */
-#define _ISOC9X_SOURCE  1
-#define _ISOC99_SOURCE  1
-#define __USE_ISOC9X    1
-#define __USE_ISOC99    1
-
 #include <assert.h>
 #include <stdlib.h>
 #include <math.h>
@@ -42,7 +36,6 @@
 #include "audio_conversion.h"
 #include "log.h"
 #include "options.h"
-#include "compat.h"
 
 static void float_to_u8 (const float *in, unsigned char *out,
 		const size_t samples)
@@ -59,13 +52,8 @@ static void float_to_u8 (const float *in, unsigned char *out,
 			out[i] = UINT8_MAX;
 		else if (f <= INT32_MIN)
 			out[i] = 0;
-		else {
-#ifdef HAVE_LRINTF
+		else
 			out[i] = (unsigned int)((lrintf(f) >> 24) - INT8_MIN);
-#else
-			out[i] = (unsigned int)(((int)f >> 24) - INT8_MIN);
-#endif
-		}
 	}
 }
 
@@ -83,13 +71,8 @@ static void float_to_s8 (const float *in, char *out, const size_t samples)
 			out[i] = INT8_MAX;
 		else if (f <= INT32_MIN)
 			out[i] = INT8_MIN;
-		else {
-#ifdef HAVE_LRINTF
+		else
 			out[i] = lrintf(f) >> 24;
-#else
-			out[i] = (int)f >> 24;
-#endif
-		}
 	}
 }
 
@@ -109,13 +92,8 @@ static void float_to_u16 (const float *in, unsigned char *out,
 			*out_val = UINT16_MAX;
 		else if (f <= INT32_MIN)
 			*out_val = 0;
-		else {
-#ifdef HAVE_LRINTF
+		else
 			*out_val = (unsigned int)((lrintf(f) >> 16) - INT16_MIN);
-#else
-			*out_val = (unsigned int)(((int)f >> 16) - INT16_MIN);
-#endif
-		}
 	}
 }
 
@@ -134,13 +112,8 @@ static void float_to_s16 (const float *in, char *out, const size_t samples)
 			*out_val = INT16_MAX;
 		else if (f <= INT32_MIN)
 			*out_val = INT16_MIN;
-		else {
-#ifdef HAVE_LRINTF
+		else
 			*out_val = lrintf(f) >> 16;
-#else
-			*out_val = ((int)f >> 16);
-#endif
-		}
 	}
 }
 
@@ -165,13 +138,8 @@ static void float_to_u32 (const float *in, unsigned char *out,
 			*out_val = U32_MAX << 8;
 		else if (f <= S32_MIN)
 			*out_val = 0;
-		else {
-#ifdef HAVE_LRINTF
+		else
 			*out_val = (uint32_t)(lrintf(f) - S32_MIN) << 8;
-#else
-			*out_val = (uint32_t)((int32_t)f - S32_MIN) << 8;
-#endif
-		}
 	}
 }
 
@@ -193,14 +161,9 @@ static void float_to_s32 (const float *in, char *out, const size_t samples)
 		if (f >= S32_MAX)
 			*out_val = S32_MAX << 8;
 		else if (f <= S32_MIN)
-			*out_val = S32_MIN << 8;
-		else {
-#ifdef HAVE_LRINTF
+			*out_val = S32_MIN * 256;
+		else
 			*out_val = lrintf(f) << 8;
-#else
-			*out_val = (int32_t)f << 8;
-#endif
-		}
 	}
 }
 
@@ -499,7 +462,7 @@ int audio_conv_new (struct audio_conversion *conv,
 #ifdef HAVE_SAMPLERATE
 		int err;
 		int resample_type = -1;
-		char *method = options_get_str ("ResampleMethod");
+		char *method = options_get_symb ("ResampleMethod");
 
 		if (!strcasecmp(method, "SincBestQuality"))
 			resample_type = SRC_SINC_BEST_QUALITY;
@@ -558,19 +521,11 @@ static float *resample_sound (struct audio_conversion *conv, const float *buf,
 	resample_data.output_frames = resample_data.input_frames
 		* resample_data.src_ratio;
 
-	if (conv->resample_buf) {
-		conv->resample_buf = (float *)xrealloc (conv->resample_buf,
-				sizeof(float) * resample_data.input_frames
-				* nchannels);
-		new_input_start = conv->resample_buf
-			+ conv->resample_buf_nsamples;
-	}
-	else {
-		conv->resample_buf = (float *)xmalloc (sizeof(float)
-				* resample_data.input_frames
-				* nchannels);
-		new_input_start = conv->resample_buf;
-	}
+	assert (conv->resample_buf || conv->resample_buf_nsamples == 0);
+	conv->resample_buf = xrealloc (conv->resample_buf,
+	                               sizeof(float) * nchannels *
+	                               resample_data.input_frames);
+	new_input_start = conv->resample_buf + conv->resample_buf_nsamples;
 
 	output = (float *)xmalloc (sizeof(float) * resample_data.output_frames
 				* nchannels);
@@ -787,7 +742,7 @@ char *audio_conv (struct audio_conversion *conv, const char *buf,
 	return curr_sound;
 }
 
-void audio_conv_destroy (struct audio_conversion *conv ATTR_UNUSED)
+void audio_conv_destroy (struct audio_conversion *conv ASSERT_ONLY)
 {
 	assert (conv != NULL);
 

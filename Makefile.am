@@ -13,6 +13,7 @@ mocp_SOURCES = log.c \
 	       main.c \
 	       common.c \
 	       common.h \
+	       compiler.h \
 	       playlist.c \
 	       playlist.h \
 	       fifo_buf.c \
@@ -63,9 +64,7 @@ mocp_SOURCES = log.c \
 	       lists.c \
 	       equalizer.h \
 	       equalizer.c
-EXTRA_mocp_SOURCES = gnugetopt.h \
-		     getopt.c \
-		     getopt1.c \
+EXTRA_mocp_SOURCES = \
 		     md5.c \
 		     md5.h \
 		     null_out.c \
@@ -81,7 +80,7 @@ EXTRA_mocp_SOURCES = gnugetopt.h \
 		     jack.c \
 		     jack.h
 man_MANS = mocp.1
-mocp_LDADD = @EXTRA_OBJS@ -lltdl
+mocp_LDADD = @EXTRA_OBJS@ -lltdl -lm
 mocp_DEPENDENCIES = @EXTRA_OBJS@
 mocp_LDFLAGS = @EXTRA_LIBS@ $(RCC_LIBS) -export-dynamic
 EXTRA_DIST = README_equalizer mocp.1 THANKS keymap.example Doxyfile \

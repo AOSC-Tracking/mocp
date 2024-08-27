@@ -16,18 +16,8 @@
 #include <string.h>
 #include <strings.h>
 #include <assert.h>
-
-#ifdef HAVE_NCURSESW_H
-# include <ncursesw/curses.h>
-#elif HAVE_NCURSES_H
-# include <ncurses.h>
-#elif HAVE_CURSES_H
-# include <curses.h>
-#endif
-
 #include <stdio.h>
 #include <errno.h>
-#include <unistd.h>
 #include <ctype.h>
 
 #define DEBUG
@@ -418,14 +408,6 @@ static struct command commands[] = {
 		1
 	},
 	{
-		KEY_CMD_NEXT_SEARCH,
-		"next_search",
-		"Find the next matching item",
-		CON_ENTRY_SEARCH,
-		{ CTRL('g'), CTRL('n'), -1 },
-		2
-	},
-	{
 		KEY_CMD_CANCEL,
 		"cancel",
 		"Exit from an entry",
@@ -700,7 +682,7 @@ static struct command commands[] = {
  	{
  		KEY_CMD_TOGGLE_MAKE_MONO,
  		"toggle_make_mono",
- 		"Toggle mono-mixing (when softmixer enabled)",
+		"Toggle mono-mixing",
  		CON_MENU,
  		{ 'J', -1 },
  		1
@@ -961,7 +943,7 @@ static int parse_key (const char *symbol)
 			fprintf (stderr,
 			         "\n\tUsing digits as keys is deprecated as they may"
 			         "\n\tbe used for specific purposes in release 2.6.\n");
-			sleep (5);
+			xsleep (5, 1);
 			digit_key_warned = true;
 		}
 		return symbol[0];
@@ -1080,7 +1062,7 @@ static void load_key_map (const char *file_name)
 	size_t cmd_ix;
 
 	if (!(file = fopen(file_name, "r")))
-		fatal ("Can't open keymap file: %s", strerror(errno));
+		fatal ("Can't open keymap file: %s", xstrerror (errno));
 
 	/* Read lines in format:
 	 * COMMAND = KEY [KEY ...]

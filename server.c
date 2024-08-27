@@ -14,11 +14,10 @@
 #endif
 
 #include <stdio.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
-#ifdef HAVE_SYS_SELECT_H
-# include <sys/select.h>
-#endif
-#include <sys/time.h>
+#include <sys/select.h>
 #ifdef HAVE_GETRLIMIT
 # include <sys/resource.h>
 #endif
@@ -57,7 +56,7 @@ struct client
 	int socket; 		/* -1 if inactive */
 	int wants_plist_events;	/* requested playlist events? */
 	struct event_queue events;
-	pthread_mutex_t events_mutex;
+	pthread_mutex_t events_mtx;
 	int requests_plist;	/* is the client waiting for the playlist? */
 	int can_send_plist;	/* can this client send a playlist? */
 	int lock;		/* is this client locking us? */
@@ -71,6 +70,9 @@ static pthread_t server_tid;
 
 /* Pipe used to wake up the server from select() from another thread. */
 static int wake_up_pipe[2];
+
+/* Socket used to accept incoming client connections. */
+static int server_sock = -1;
 
 /* Set to 1 when a signal arrived causing the program to exit. */
 static volatile int server_quit = 0;
@@ -88,7 +90,7 @@ static struct {
 	-1
 };
 
-static struct tags_cache tags_cache;
+static struct tags_cache *tags_cache;
 
 extern char **environ;
 
@@ -98,13 +100,13 @@ static void write_pid_file ()
 	FILE *file;
 
 	if ((file = fopen(fname, "w")) == NULL)
-		fatal ("Can't open pid file for writing: %s", strerror(errno));
+		fatal ("Can't open pid file for writing: %s", xstrerror (errno));
 	fprintf (file, "%d\n", getpid());
 	fclose (file);
 }
 
 /* Check if there is a pid file and if it is valid, return the pid, else 0 */
-static int check_pid_file ()
+static pid_t check_pid_file ()
 {
 	FILE *file;
 	pid_t pid;
@@ -120,6 +122,20 @@ static int check_pid_file ()
 	fclose (file);
 
 	return pid;
+}
+
+static void sig_chld (int sig LOGIT_ONLY)
+{
+	int saved_errno;
+	pid_t rc;
+
+	log_signal (sig);
+
+	saved_errno = errno;
+	do {
+		rc = waitpid (-1, NULL, WNOHANG);
+	} while (rc > 0);
+	errno = saved_errno;
 }
 
 static void sig_exit (int sig)
@@ -139,7 +155,7 @@ static void clients_init ()
 
 	for (i = 0; i < CLIENTS_MAX; i++) {
 		clients[i].socket = -1;
-		pthread_mutex_init (&clients[i].events_mutex, NULL);
+		pthread_mutex_init (&clients[i].events_mtx, NULL);
 	}
 }
 
@@ -149,9 +165,9 @@ static void clients_cleanup ()
 
 	for (i = 0; i < CLIENTS_MAX; i++) {
 		clients[i].socket = -1;
-		rc = pthread_mutex_destroy (&clients[i].events_mutex);
+		rc = pthread_mutex_destroy (&clients[i].events_mtx);
 		if (rc != 0)
-			logit ("Can't destroy events mutex: %s", strerror (rc));
+			log_errno ("Can't destroy events mutex", rc);
 	}
 }
 
@@ -163,15 +179,15 @@ static int add_client (int sock)
 	for (i = 0; i < CLIENTS_MAX; i++)
 		if (clients[i].socket == -1) {
 			clients[i].wants_plist_events = 0;
-			LOCK (clients[i].events_mutex);
+			LOCK (clients[i].events_mtx);
 			event_queue_free (&clients[i].events);
 			event_queue_init (&clients[i].events);
-			UNLOCK (clients[i].events_mutex);
+			UNLOCK (clients[i].events_mtx);
 			clients[i].socket = sock;
 			clients[i].requests_plist = 0;
 			clients[i].can_send_plist = 0;
 			clients[i].lock = 0;
-			tags_cache_clear_queue (&tags_cache, i);
+			tags_cache_clear_queue (tags_cache, i);
 			return 1;
 		}
 
@@ -238,14 +254,14 @@ static int client_index (const struct client *cli)
 static void del_client (struct client *cli)
 {
 	cli->socket = -1;
-	LOCK (cli->events_mutex);
+	LOCK (cli->events_mtx);
 	event_queue_free (&cli->events);
-	tags_cache_clear_queue (&tags_cache, client_index(cli));
-	UNLOCK (cli->events_mutex);
+	tags_cache_clear_queue (tags_cache, client_index(cli));
+	UNLOCK (cli->events_mtx);
 }
 
 /* Check if the process with given PID exists. Return != 0 if so. */
-static int valid_pid (const int pid)
+static int valid_pid (const pid_t pid)
 {
 	return kill(pid, 0) == 0 ? 1 : 0;
 }
@@ -257,21 +273,7 @@ static void wake_up_server ()
 	debug ("Waking up the server");
 
 	if (write(wake_up_pipe[1], &w, sizeof(w)) < 0)
-		logit ("Can't wake up the server: (write() failed) %s",
-				strerror(errno));
-}
-
-/* Thread-safe signal() version */
-static void thread_signal (const int signum, void (*func)(int))
-{
-	struct sigaction act;
-
-	act.sa_handler = func;
-	act.sa_flags = 0;
-	sigemptyset (&act.sa_mask);
-
-	if (sigaction(signum, &act, 0) == -1)
-		fatal ("sigaction() failed: %s", strerror(errno));
+		log_errno ("Can't wake up the server: (write() failed)", errno);
 }
 
 static void redirect_output (FILE *stream)
@@ -284,12 +286,12 @@ static void redirect_output (FILE *stream)
 		rc = freopen ("/dev/null", "w", stream);
 
 	if (!rc)
-		fatal ("Can't open /dev/null: %s", strerror (errno));
+		fatal ("Can't open /dev/null: %s", xstrerror (errno));
 }
 
 static void log_process_stack_size ()
 {
-#ifdef HAVE_GETRLIMIT
+#if !defined(NDEBUG) && defined(HAVE_GETRLIMIT)
 	int rc;
 	struct rlimit limits;
 
@@ -301,7 +303,7 @@ static void log_process_stack_size ()
 
 static void log_pthread_stack_size ()
 {
-#ifdef HAVE_PTHREAD_ATTR_GETSTACKSIZE
+#if !defined(NDEBUG) && defined(HAVE_PTHREAD_ATTR_GETSTACKSIZE)
 	int rc;
 	size_t stack_size;
 	pthread_attr_t attr;
@@ -318,14 +320,46 @@ static void log_pthread_stack_size ()
 #endif
 }
 
+/* Handle running external command on requested event. */
+static void run_extern_cmd (const char *event)
+{
+	char *command;
+
+	command = xstrdup (options_get_str (event));
+
+	if (command) {
+		char *args[2], *err;
+
+		args[0] = xstrdup (command);
+		args[1] = NULL;
+
+		switch (fork ()) {
+		case 0:
+			execve (command, args, environ);
+			fatal ("Error when running %s command '%s': %s",
+			        event, command, xstrerror (errno));
+		case -1:
+			err = xstrerror (errno);
+			logit ("Error when running %s command '%s': %s",
+			        event, command, err);
+			free (err);
+			break;
+		}
+
+		free (command);
+		free (args[0]);
+	}
+}
+
 /* Initialize the server - return fd of the listening socket or -1 on error */
-int server_init (int debugging, int foreground)
+void server_init (int debugging, int foreground)
 {
 	struct sockaddr_un sock_name;
-	int server_sock;
-	int pid;
+	pid_t pid;
 
 	logit ("Starting MOC Server");
+
+	assert (server_sock == -1);
 
 	pid = check_pid_file ();
 	if (pid && valid_pid(pid)) {
@@ -346,28 +380,31 @@ int server_init (int debugging, int foreground)
 		if (debugging) {
 			logfp = fopen (SERVER_LOG, "a");
 			if (!logfp)
-				fatal ("Can't open server log file: %s", strerror (errno));
+				fatal ("Can't open server log file: %s", xstrerror (errno));
 		}
 		log_init_stream (logfp, SERVER_LOG);
 	}
 
 	if (pipe(wake_up_pipe) < 0)
-		fatal ("pipe() failed: %s", strerror(errno));
+		fatal ("pipe() failed: %s", xstrerror (errno));
 
 	unlink (socket_name());
 
-	/* Create a socket */
-	if ((server_sock = socket (PF_LOCAL, SOCK_STREAM, 0)) == -1)
-		fatal ("Can't create socket: %s", strerror(errno));
-	sock_name.sun_family = AF_LOCAL;
+	/* Create a socket.
+	 * For reasons why AF_UNIX is the correct constant to use in both
+	 * cases, see the commentary the SVN log for commit r9999. */
+	server_sock = socket (AF_UNIX, SOCK_STREAM, 0);
+	if (server_sock == -1)
+		fatal ("Can't create socket: %s", xstrerror (errno));
+	sock_name.sun_family = AF_UNIX;
 	strcpy (sock_name.sun_path, socket_name());
 
 	/* Bind to socket */
 	if (bind(server_sock, (struct sockaddr *)&sock_name, SUN_LEN(&sock_name)) == -1)
-		fatal ("Can't bind() to the socket: %s", strerror(errno));
+		fatal ("Can't bind() to the socket: %s", xstrerror (errno));
 
 	if (listen(server_sock, 1) == -1)
-		fatal ("listen() failed: %s", strerror(errno));
+		fatal ("listen() failed: %s", xstrerror (errno));
 
 	/* Log stack sizes so stack overflows can be debugged. */
 	log_process_stack_size ();
@@ -375,15 +412,16 @@ int server_init (int debugging, int foreground)
 
 	clients_init ();
 	audio_initialize ();
-	tags_cache_init (&tags_cache, options_get_int("TagsCacheSize"));
-	tags_cache_load (&tags_cache, create_file_name("cache"));
+	tags_cache = tags_cache_new (options_get_int("TagsCacheSize"));
+	tags_cache_load (tags_cache, create_file_name("cache"));
 
 	server_tid = pthread_self ();
-	thread_signal (SIGTERM, sig_exit);
-	thread_signal (SIGINT, foreground ? sig_exit : SIG_IGN);
-	thread_signal (SIGHUP, SIG_IGN);
-	thread_signal (SIGQUIT, sig_exit);
-	thread_signal (SIGPIPE, SIG_IGN);
+	xsignal (SIGTERM, sig_exit);
+	xsignal (SIGINT, foreground ? sig_exit : SIG_IGN);
+	xsignal (SIGHUP, SIG_IGN);
+	xsignal (SIGQUIT, sig_exit);
+	xsignal (SIGPIPE, SIG_IGN);
+	xsignal (SIGCHLD, sig_chld);
 
 	write_pid_file ();
 
@@ -394,7 +432,10 @@ int server_init (int debugging, int foreground)
 		redirect_output (stderr);
 	}
 
-	return server_sock;
+	logit ("Running OnServerStart");
+	run_extern_cmd ("OnServerStart");
+
+	return;
 }
 
 /* Send EV_DATA and the integer value. Return 0 on error. */
@@ -403,6 +444,18 @@ static int send_data_int (const struct client *cli, const int data)
 	assert (cli->socket != -1);
 
 	if (!send_int(cli->socket, EV_DATA) || !send_int(cli->socket, data))
+		return 0;
+
+	return 1;
+}
+
+/* Send EV_DATA and the boolean value. Return 0 on error. */
+static int send_data_bool (const struct client *cli, const bool data)
+{
+	assert (cli->socket != -1);
+
+	if (!send_int(cli->socket, EV_DATA) ||
+	    !send_int(cli->socket, data ? 1 : 0))
 		return 0;
 
 	return 1;
@@ -418,9 +471,9 @@ static int send_data_str (const struct client *cli, const char *str) {
 /* Add event to the client's queue */
 static void add_event (struct client *cli, const int event, void *data)
 {
-	LOCK (cli->events_mutex);
+	LOCK (cli->events_mtx);
 	event_push (&cli->events, event, data);
-	UNLOCK (cli->events_mutex);
+	UNLOCK (cli->events_mtx);
 }
 
 static void on_song_change ()
@@ -430,8 +483,7 @@ static void on_song_change ()
 
 	int ix;
 	bool same_file, unpaused;
-	char *curr_file;
-	char **args, *cmd;
+	char *curr_file, **args;
 	struct file_tags *curr_tags;
 	lists_t_strs *arg_list;
 
@@ -461,7 +513,7 @@ static void on_song_change ()
 		return;
 	}
 
-	curr_tags = tags_cache_get_immediate (&tags_cache, curr_file,
+	curr_tags = tags_cache_get_immediate (tags_cache, curr_file,
 	                                      TAGS_COMMENTS | TAGS_TIME);
 	arg_list = lists_strs_new (lists_strs_size (on_song_change));
 	for (ix = 0; ix < lists_strs_size (on_song_change); ix += 1) {
@@ -488,8 +540,8 @@ static void on_song_change ()
 				break;
 			case 'n':
 				if (curr_tags->track >= 0) {
-					str = (char *) xmalloc (sizeof (char) * 4);
-					snprintf (str, 4, "%d", curr_tags->track);
+					str = (char *) xmalloc (sizeof (char) * 16);
+					snprintf (str, 16, "%d", curr_tags->track);
 					lists_strs_push (arg_list, str);
 				}
 				else
@@ -500,8 +552,8 @@ static void on_song_change ()
 				break;
 			case 'D':
 				if (curr_tags->time >= 0) {
-					str = (char *) xmalloc (sizeof (char) * 10);
-					snprintf (str, 10, "%d", curr_tags->time);
+					str = (char *) xmalloc (sizeof (char) * 16);
+					snprintf (str, 16, "%d", curr_tags->time);
 					lists_strs_push (arg_list, str);
 				}
 				else
@@ -509,7 +561,7 @@ static void on_song_change ()
 				break;
 			case 'd':
 				if (curr_tags->time >= 0) {
-					str = (char *) xmalloc (sizeof (char) * 12);
+					str = (char *) xmalloc (sizeof (char) * 32);
 					sec_to_min (str, curr_tags->time);
 					lists_strs_push (arg_list, str);
 				}
@@ -523,50 +575,29 @@ static void on_song_change ()
 	}
 	tags_free (curr_tags);
 
-	cmd = lists_strs_fmt (arg_list, " %s");
-	debug ("Running command: %s", cmd);
-	free (cmd);
+#ifndef NDEBUG
+	{
+		char *cmd;
+
+		cmd = lists_strs_fmt (arg_list, " %s");
+		debug ("Running command: %s", cmd);
+		free (cmd);
+	}
+#endif
 
 	switch (fork ()) {
 	case 0:
 		args = lists_strs_save (arg_list);
 		execve (args[0], args, environ);
-		exit (EXIT_FAILURE);
+		fatal ("Error when running OnSongChange command '%s': %s",
+		        args[0], xstrerror (errno));
 	case -1:
-		logit ("Failed to fork(): %s", strerror (errno));
+		log_errno ("Failed to fork()", errno);
 	}
 
 	lists_strs_free (arg_list);
 	free (last_file);
 	last_file = curr_file;
-}
-
-/* Handle running external command on Stop event. */
-static void on_stop ()
-{
-	char *command;
-
-	command = xstrdup (options_get_str("OnStop"));
-
-	if (command) {
-		char *args[2];
-
-		args[0] = xstrdup (command);
-		args[1] = NULL;
-
-		switch (fork()) {
-			case 0:
-				execve (command, args, environ);
-				exit (EXIT_FAILURE);
-			case -1:
-				logit ("Error when running OnStop command '%s': %s",
-						command, strerror(errno));
-				break;
-		}
-
-		free (command);
-		free (args[0]);
-	}
 }
 
 /* Return true iff 'event' is a playlist event. */
@@ -596,7 +627,7 @@ static void add_event_all (const int event, const void *data)
 				on_song_change ();
 				break;
 			case STATE_STOP:
-				on_stop ();
+				run_extern_cmd ("OnStop");
 				break;
 		}
 	}
@@ -646,12 +677,12 @@ static int flush_events (struct client *cli)
 {
 	enum noblock_io_status st = NB_IO_OK;
 
-	LOCK (cli->events_mutex);
+	LOCK (cli->events_mtx);
 	while (!event_queue_empty(&cli->events)
 			&& (st = event_send_noblock(cli->socket, &cli->events))
 			== NB_IO_OK)
 		;
-	UNLOCK (cli->events_mutex);
+	UNLOCK (cli->events_mtx);
 
 	return st != NB_IO_ERR ? 1 : 0;
 }
@@ -677,8 +708,10 @@ static void server_shutdown ()
 {
 	logit ("Server exiting...");
 	audio_exit ();
-	tags_cache_save (&tags_cache, create_file_name("tags_cache"));
-	tags_cache_destroy (&tags_cache);
+	tags_cache_free (tags_cache);
+	tags_cache = NULL;
+	logit ("Running OnServerStop");
+	run_extern_cmd ("OnServerStop");
 	unlink (socket_name());
 	unlink (create_file_name(PID_FILE));
 	close (wake_up_pipe[0]);
@@ -790,9 +823,10 @@ static int req_jump_to (struct client *cli)
 }
 
 /* Report an error logging it and sending a message to the client. */
-void server_error (const char *msg)
+void server_error (const char *file, int line, const char *function,
+                   const char *msg)
 {
-	logit ("ERROR: %s", msg);
+	internal_logit (file, line, function, "ERROR: %s", msg);
 	add_event_all (EV_SRV_ERROR, msg);
 }
 
@@ -833,8 +867,8 @@ static int send_option (struct client *cli)
 		return 0;
 	}
 
-	/* All supported options are integer type. */
-	if (!send_data_int(cli, options_get_int(name))) {
+	/* All supported options are boolean type. */
+	if (!send_data_bool(cli, options_get_bool(name))) {
 		free (name);
 		return 0;
 	}
@@ -860,7 +894,7 @@ static int get_set_option (struct client *cli)
 		return 0;
 	}
 
-	options_set_int (name, val);
+	options_set_bool (name, val ? true : false);
 	free (name);
 
 	add_event_all (EV_OPTIONS, NULL);
@@ -1328,7 +1362,7 @@ static int get_file_tags (const int cli_id)
 		return 0;
 	}
 
-	tags_cache_add_request (&tags_cache, file, tags_sel, cli_id);
+	tags_cache_add_request (tags_cache, file, tags_sel, cli_id);
 	free (file);
 
 	return 1;
@@ -1341,7 +1375,7 @@ static int abort_tags_requests (const int cli_id)
 	if (!(file = get_str(clients[cli_id].socket)))
 		return 0;
 
-	tags_cache_clear_up_to (&tags_cache, file, cli_id);
+	tags_cache_clear_up_to (tags_cache, file, cli_id);
 	free (file);
 
 	return 1;
@@ -1371,9 +1405,6 @@ static int req_list_move (struct client *cli)
 /* Handle CMD_QUEUE_MOVE. Return 0 on error. */
 static int req_queue_move (const struct client *cli)
 {
-	/*char *from;
-	char *to;
-	*/
 	struct move_ev_data m;
 
 	if (!(m.from = get_str(cli->socket)))
@@ -1635,10 +1666,10 @@ static void add_clients_fds (fd_set *read, fd_set *write)
 			if (locking_client() == -1 || is_locking(&clients[i]))
 				FD_SET (clients[i].socket, read);
 
-			LOCK (clients[i].events_mutex);
+			LOCK (clients[i].events_mtx);
 			if (!event_queue_empty(&clients[i].events))
 				FD_SET (clients[i].socket, write);
-			UNLOCK (clients[i].events_mutex);
+			UNLOCK (clients[i].events_mtx);
 		}
 }
 
@@ -1688,13 +1719,16 @@ static void close_clients ()
 }
 
 /* Handle incoming connections */
-void server_loop (int list_sock)
+void server_loop ()
 {
 	struct sockaddr_un client_name;
 	socklen_t name_len = sizeof (client_name);
-	int end = 0;
 
 	logit ("MOC server started, pid: %d", getpid());
+
+	assert (server_sock != -1);
+
+	log_circular_start ();
 
 	do {
 		int res;
@@ -1702,30 +1736,29 @@ void server_loop (int list_sock)
 
 		FD_ZERO (&fds_read);
 		FD_ZERO (&fds_write);
-		FD_SET (list_sock, &fds_read);
+		FD_SET (server_sock, &fds_read);
 		FD_SET (wake_up_pipe[0], &fds_read);
 		add_clients_fds (&fds_read, &fds_write);
 
+		res = 0;
 		if (!server_quit)
-			res = select (max_fd(list_sock)+1, &fds_read,
+			res = select (max_fd(server_sock)+1, &fds_read,
 					&fds_write, NULL, NULL);
-		else
-			res = 0;
 
 		if (res == -1 && errno != EINTR && !server_quit)
-			fatal ("select() failed: %s", strerror (errno));
+			fatal ("select() failed: %s", xstrerror (errno));
 
 		if (!server_quit && res >= 0) {
-			if (FD_ISSET(list_sock, &fds_read)) {
+			if (FD_ISSET(server_sock, &fds_read)) {
 				int client_sock;
 
 				debug ("accept()ing connection...");
-				client_sock = accept (list_sock,
+				client_sock = accept (server_sock,
 					(struct sockaddr *)&client_name,
 					&name_len);
 
 				if (client_sock == -1)
-					fatal ("accept() failed: %s", strerror(errno));
+					fatal ("accept() failed: %s", xstrerror (errno));
 				logit ("Incoming connection");
 				if (!add_client(client_sock))
 					busy (client_sock);
@@ -1737,7 +1770,7 @@ void server_loop (int list_sock)
 				logit ("Got 'wake up'");
 
 				if (read(wake_up_pipe[0], &w, sizeof(w)) < 0)
-					fatal ("Can't read wake up signal: %s", strerror(errno));
+					fatal ("Can't read wake up signal: %s", xstrerror (errno));
 			}
 
 			send_events (&fds_write);
@@ -1747,11 +1780,15 @@ void server_loop (int list_sock)
 		if (server_quit)
 			logit ("Exiting...");
 
-	} while (!end && !server_quit);
+	} while (!server_quit);
+
+	log_circular_log ();
+	log_circular_stop ();
 
 	close_clients ();
 	clients_cleanup ();
-	close (list_sock);
+	close (server_sock);
+	server_sock = -1;
 	server_shutdown ();
 }
 

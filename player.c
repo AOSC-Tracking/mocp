@@ -60,7 +60,7 @@ struct bitrate_list
 {
 	struct bitrate_list_node *head;
 	struct bitrate_list_node *tail;
-	pthread_mutex_t mutex;
+	pthread_mutex_t mtx;
 };
 
 struct md5_data {
@@ -88,7 +88,7 @@ struct precache precache;
 
 /* Request conditional and mutex. */
 static pthread_cond_t request_cond = PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t request_cond_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t request_cond_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static enum request request = REQ_NOTHING;
 static int req_seek;
@@ -104,11 +104,11 @@ static enum
 static struct file_tags *curr_tags = NULL;
 
 /* Mutex for curr_tags and tags_source. */
-static pthread_mutex_t curr_tags_mut = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t curr_tags_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* Stream associated with the currently playing decoder. */
 static struct io_stream *decoder_stream = NULL;
-static pthread_mutex_t decoder_stream_mut = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t decoder_stream_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static int prebuffering = 0; /* are we prebuffering now? */
 
@@ -120,14 +120,14 @@ static void bitrate_list_init (struct bitrate_list *b)
 
 	b->head = NULL;
 	b->tail = NULL;
-	pthread_mutex_init (&b->mutex, NULL);
+	pthread_mutex_init (&b->mtx, NULL);
 }
 
 static void bitrate_list_empty (struct bitrate_list *b)
 {
 	assert (b != NULL);
 
-	LOCK (b->mutex);
+	LOCK (b->mtx);
 	if (b->head) {
 		while (b->head) {
 			struct bitrate_list_node *t = b->head->next;
@@ -141,7 +141,7 @@ static void bitrate_list_empty (struct bitrate_list *b)
 
 	debug ("Bitrate list elements removed.");
 
-	UNLOCK (b->mutex);
+	UNLOCK (b->mtx);
 }
 
 static void bitrate_list_destroy (struct bitrate_list *b)
@@ -152,9 +152,9 @@ static void bitrate_list_destroy (struct bitrate_list *b)
 
 	bitrate_list_empty (b);
 
-	rc = pthread_mutex_destroy (&b->mutex);
+	rc = pthread_mutex_destroy (&b->mtx);
 	if (rc != 0)
-		logit ("Can't destroy bitrate list mutex: %s", strerror (rc));
+		log_errno ("Can't destroy bitrate list mutex", rc);
 }
 
 static void bitrate_list_add (struct bitrate_list *b, const int time,
@@ -162,7 +162,7 @@ static void bitrate_list_add (struct bitrate_list *b, const int time,
 {
 	assert (b != NULL);
 
-	LOCK (b->mutex);
+	LOCK (b->mtx);
 	if (!b->tail) {
 		b->head = b->tail = (struct bitrate_list_node *)xmalloc (
 				sizeof(struct bitrate_list_node));
@@ -190,7 +190,7 @@ static void bitrate_list_add (struct bitrate_list *b, const int time,
 	else
 		debug ("Not adding bitrate %d at time %d because it is for"
 				" the same time as the last bitrate", bitrate, time);
-	UNLOCK (b->mutex);
+	UNLOCK (b->mtx);
 }
 
 static int bitrate_list_get (struct bitrate_list *b, const int time)
@@ -199,7 +199,7 @@ static int bitrate_list_get (struct bitrate_list *b, const int time)
 
 	assert (b != NULL);
 
-	LOCK (b->mutex);
+	LOCK (b->mtx);
 	if (b->head) {
 		while (b->head->next && b->head->next->time <= time) {
 			struct bitrate_list_node *o = b->head;
@@ -216,7 +216,7 @@ static int bitrate_list_get (struct bitrate_list *b, const int time)
 		debug ("Getting bitrate for time %d (no bitrate information)", time);
 		bitrate = -1;
 	}
-	UNLOCK (b->mutex);
+	UNLOCK (b->mtx);
 
 	return bitrate;
 }
@@ -333,7 +333,7 @@ static void start_precache (struct precache *precache, const char *file)
 	precache->ok = 0;
 	rc = pthread_create (&precache->tid, NULL, precache_thread, precache);
 	if (rc != 0)
-		logit ("Could not run precache thread: %s", strerror (rc));
+		log_errno ("Could not run precache thread", rc);
 	else
 		precache->running = 1;
 }
@@ -347,7 +347,7 @@ static void precache_wait (struct precache *precache)
 		rc = pthread_join (precache->tid, NULL);
 		if (rc != 0)
 			fatal ("pthread_join() for precache thread failed: %s",
-			        strerror (rc));
+			        xstrerror (rc));
 		precache->running = 0;
 		debug ("done");
 	}
@@ -373,7 +373,7 @@ void player_init ()
 	precache.ok = 0;
 }
 
-static void show_tags (const struct file_tags *tags)
+static void show_tags (const struct file_tags *tags DEBUG_ONLY)
 {
 	debug ("TAG[title]: %s", tags->title ? tags->title : "N/A");
 	debug ("TAG[album]: %s", tags->album ? tags->album : "N/A");
@@ -391,7 +391,7 @@ static void update_tags (const struct decoder *f, void *decoder_data,
 
 	new_tags = tags_new ();
 
-	LOCK (curr_tags_mut);
+	LOCK (curr_tags_mtx);
 	if (f->current_tags && f->current_tags(decoder_data, new_tags)
 			&& new_tags->title) {
 		tags_changed = 1;
@@ -422,15 +422,15 @@ static void update_tags (const struct decoder *f, void *decoder_data,
 
 	tags_free (new_tags);
 
-	UNLOCK (curr_tags_mut);
+	UNLOCK (curr_tags_mtx);
 }
 
 /* Called when some free space in the output buffer appears. */
-static void buf_free_callback ()
+static void buf_free_cb ()
 {
-	LOCK (request_cond_mutex);
+	LOCK (request_cond_mtx);
 	pthread_cond_broadcast (&request_cond);
-	UNLOCK (request_cond_mutex);
+	UNLOCK (request_cond_mtx);
 
 	update_time ();
 }
@@ -451,16 +451,16 @@ static void decode_loop (const struct decoder *f, void *decoder_data,
 	float decode_time = already_decoded_sec; /* the position of the decoder
 	                                            (in seconds) */
 
-	out_buf_set_free_callback (out_buf, buf_free_callback);
+	out_buf_set_free_callback (out_buf, buf_free_cb);
 
-	LOCK (curr_tags_mut);
+	LOCK (curr_tags_mtx);
 	curr_tags = tags_new ();
-	UNLOCK (curr_tags_mut);
+	UNLOCK (curr_tags_mtx);
 
 	if (f->get_stream) {
-		LOCK (decoder_stream_mut);
+		LOCK (decoder_stream_mtx);
 		decoder_stream = f->get_stream (decoder_data);
-		UNLOCK (decoder_stream_mut);
+		UNLOCK (decoder_stream_mtx);
 	}
 	else
 		logit ("No get_stream() function");
@@ -470,11 +470,11 @@ static void decode_loop (const struct decoder *f, void *decoder_data,
 	while (1) {
 		debug ("loop...");
 
-		LOCK (request_cond_mutex);
+		LOCK (request_cond_mtx);
 		if (!eof && !decoded) {
 			struct decoder_error err;
 
-			UNLOCK (request_cond_mutex);
+			UNLOCK (request_cond_mtx);
 
 			if (decoder_stream && out_buf_get_fill(out_buf)
 					< PREBUFFER_THRESHOLD) {
@@ -526,14 +526,14 @@ static void decode_loop (const struct decoder *f, void *decoder_data,
 			debug ("waiting...");
 			if (eof && !precache.file && next_file
 					&& file_type(next_file) == F_SOUND
-					&& options_get_int("Precache")
+					&& options_get_bool("Precache")
 					&& options_get_bool("AutoNext"))
 				start_precache (&precache, next_file);
-			pthread_cond_wait (&request_cond, &request_cond_mutex);
-			UNLOCK (request_cond_mutex);
+			pthread_cond_wait (&request_cond, &request_cond_mtx);
+			UNLOCK (request_cond_mtx);
 		}
 		else
-			UNLOCK (request_cond_mutex);
+			UNLOCK (request_cond_mtx);
 
 		/* When clearing request, we must make sure, that another
 		 * request will not arrive at the moment, so we check if
@@ -544,10 +544,10 @@ static void decode_loop (const struct decoder *f, void *decoder_data,
 			md5->okay = false;
 			out_buf_stop (out_buf);
 
-			LOCK (request_cond_mutex);
+			LOCK (request_cond_mtx);
 			if (request == REQ_STOP)
 				request = REQ_NOTHING;
-			UNLOCK (request_cond_mutex);
+			UNLOCK (request_cond_mtx);
 
 			break;
 		}
@@ -569,10 +569,10 @@ static void decode_loop (const struct decoder *f, void *decoder_data,
 				decoded = 0;
 			}
 
-			LOCK (request_cond_mutex);
+			LOCK (request_cond_mtx);
 			if (request == REQ_SEEK)
 				request = REQ_NOTHING;
-			UNLOCK (request_cond_mutex);
+			UNLOCK (request_cond_mtx);
 
 		}
 		else if (!eof && decoded <= out_buf_get_free(out_buf)
@@ -608,19 +608,19 @@ static void decode_loop (const struct decoder *f, void *decoder_data,
 
 	status_msg ("");
 
-	LOCK (decoder_stream_mut);
+	LOCK (decoder_stream_mtx);
 	decoder_stream = NULL;
 	f->close (decoder_data);
-	UNLOCK (decoder_stream_mut);
+	UNLOCK (decoder_stream_mtx);
 
 	bitrate_list_destroy (&bitrate_list);
 
-	LOCK (curr_tags_mut);
+	LOCK (curr_tags_mtx);
 	if (curr_tags) {
 		tags_free (curr_tags);
 		curr_tags = NULL;
 	}
-	UNLOCK (curr_tags_mut);
+	UNLOCK (curr_tags_mtx);
 
 	out_buf_wait (out_buf);
 
@@ -810,9 +810,9 @@ static void play_stream (const struct decoder *f, struct out_buf *out_buf)
 	decoder_data = f->open_stream (decoder_stream);
 	f->get_error (decoder_data, &err);
 	if (err.type != ERROR_OK) {
-		LOCK (decoder_stream_mut);
+		LOCK (decoder_stream_mtx);
 		decoder_stream = NULL;
-		UNLOCK (decoder_stream_mut);
+		UNLOCK (decoder_stream_mtx);
 
 		f->close (decoder_data);
 		error ("%s", err.err);
@@ -829,11 +829,11 @@ static void play_stream (const struct decoder *f, struct out_buf *out_buf)
 }
 
 /* Callback for io buffer fill - show the prebuffering state. */
-static void fill_callback (struct io_stream *s ATTR_UNUSED, size_t fill,
-		size_t buf_size ATTR_UNUSED, void *data_ptr ATTR_UNUSED)
+static void fill_cb (struct io_stream *unused1 ATTR_UNUSED, size_t fill,
+		size_t unused2 ATTR_UNUSED, void *unused3 ATTR_UNUSED)
 {
 	if (prebuffering) {
-		char msg[32];
+		char msg[64];
 
 		sprintf (msg, "Prebuffering %zu/%d KB", fill / 1024U,
 		              options_get_int("Prebuffering"));
@@ -850,31 +850,31 @@ void player (const char *file, const char *next_file, struct out_buf *out_buf)
 	if (file_type(file) == F_URL) {
 		status_msg ("Connecting...");
 
-		LOCK (decoder_stream_mut);
+		LOCK (decoder_stream_mtx);
 		decoder_stream = io_open (file, 1);
 		if (!io_ok(decoder_stream)) {
 			error ("Could not open URL: %s", io_strerror(decoder_stream));
 			io_close (decoder_stream);
 			status_msg ("");
 			decoder_stream = NULL;
-			UNLOCK (decoder_stream_mut);
+			UNLOCK (decoder_stream_mtx);
 			return;
 		}
-		UNLOCK (decoder_stream_mut);
+		UNLOCK (decoder_stream_mtx);
 
 		f = get_decoder_by_content (decoder_stream);
 		if (!f) {
-			LOCK (decoder_stream_mut);
+			LOCK (decoder_stream_mtx);
 			io_close (decoder_stream);
 			status_msg ("");
 			decoder_stream = NULL;
-			UNLOCK (decoder_stream_mut);
+			UNLOCK (decoder_stream_mtx);
 			return;
 		}
 
 		status_msg ("Prebuffering...");
 		prebuffering = 1;
-		io_set_buf_fill_callback (decoder_stream, fill_callback, NULL);
+		io_set_buf_fill_callback (decoder_stream, fill_cb, NULL);
 		io_prebuffer (decoder_stream,
 				options_get_int("Prebuffering") * 1024);
 		prebuffering = 0;
@@ -886,9 +886,9 @@ void player (const char *file, const char *next_file, struct out_buf *out_buf)
 	}
 	else {
 		f = get_decoder (file);
-		LOCK (decoder_stream_mut);
+		LOCK (decoder_stream_mtx);
 		decoder_stream = NULL;
-		UNLOCK (decoder_stream_mut);
+		UNLOCK (decoder_stream_mtx);
 
 		if (!f) {
 			error ("Can't get decoder for %s", file);
@@ -907,18 +907,18 @@ void player_cleanup ()
 {
 	int rc;
 
-	rc = pthread_mutex_destroy (&request_cond_mutex);
+	rc = pthread_mutex_destroy (&request_cond_mtx);
 	if (rc != 0)
-		logit ("Can't destroy request mutex: %s", strerror (rc));
-	rc = pthread_mutex_destroy (&curr_tags_mut);
+		log_errno ("Can't destroy request mutex", rc);
+	rc = pthread_mutex_destroy (&curr_tags_mtx);
 	if (rc != 0)
-		logit ("Can't destroy tags mutex: %s", strerror (rc));
-	rc = pthread_mutex_destroy (&decoder_stream_mut);
+		log_errno ("Can't destroy tags mutex", rc);
+	rc = pthread_mutex_destroy (&decoder_stream_mtx);
 	if (rc != 0)
-		logit ("Can't destroy decoder_stream mutex: %s", strerror (rc));
+		log_errno ("Can't destroy decoder_stream mutex", rc);
 	rc = pthread_cond_destroy (&request_cond);
 	if (rc != 0)
-		logit ("Can't destroy request condition: %s", strerror (rc));
+		log_errno ("Can't destroy request condition", rc);
 
 	precache_wait (&precache);
 	precache_reset (&precache);
@@ -934,16 +934,16 @@ void player_stop ()
 	logit ("requesting stop");
 	request = REQ_STOP;
 
-	LOCK (decoder_stream_mut);
+	LOCK (decoder_stream_mtx);
 	if (decoder_stream) {
 		logit ("decoder_stream present, aborting...");
 		io_abort (decoder_stream);
 	}
-	UNLOCK (decoder_stream_mut);
+	UNLOCK (decoder_stream_mtx);
 
-	LOCK (request_cond_mutex);
+	LOCK (request_cond_mtx);
 	pthread_cond_signal (&request_cond);
-	UNLOCK (request_cond_mutex);
+	UNLOCK (request_cond_mtx);
 }
 
 void player_seek (const int sec)
@@ -954,9 +954,9 @@ void player_seek (const int sec)
 	if (time >= 0) {
 		request = REQ_SEEK;
 		req_seek = sec + time;
-		LOCK (request_cond_mutex);
+		LOCK (request_cond_mtx);
 		pthread_cond_signal (&request_cond);
-		UNLOCK (request_cond_mutex);
+		UNLOCK (request_cond_mtx);
 	}
 }
 
@@ -964,42 +964,40 @@ void player_jump_to (const int sec)
 {
 	request = REQ_SEEK;
 	req_seek = sec;
-	LOCK (request_cond_mutex);
+	LOCK (request_cond_mtx);
 	pthread_cond_signal (&request_cond);
-	UNLOCK (request_cond_mutex);
+	UNLOCK (request_cond_mtx);
 }
 
 /* Stop playing, clear the output buffer, but allow to unpause by starting
- * playing the same stream. This is usefull for internet streams that can't
+ * playing the same stream.  This is useful for Internet streams that can't
  * be really paused. */
 void player_pause ()
 {
 	request = REQ_PAUSE;
-	LOCK (request_cond_mutex);
+	LOCK (request_cond_mtx);
 	pthread_cond_signal (&request_cond);
-	UNLOCK (request_cond_mutex);
+	UNLOCK (request_cond_mtx);
 }
 
 void player_unpause ()
 {
 	request = REQ_UNPAUSE;
-	LOCK (request_cond_mutex);
+	LOCK (request_cond_mtx);
 	pthread_cond_signal (&request_cond);
-	UNLOCK (request_cond_mutex);
+	UNLOCK (request_cond_mtx);
 }
 
 /* Return tags for the currently played file or NULL if there are no tags.
  * Tags are duplicated. */
 struct file_tags *player_get_curr_tags ()
 {
-	struct file_tags *tags;
+	struct file_tags *tags = NULL;
 
-	LOCK (curr_tags_mut);
+	LOCK (curr_tags_mtx);
 	if (curr_tags)
 		tags = tags_dup (curr_tags);
-	else
-		tags = NULL;
-	UNLOCK (curr_tags_mut);
+	UNLOCK (curr_tags_mtx);
 
 	return tags;
 }

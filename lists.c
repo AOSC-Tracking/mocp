@@ -17,11 +17,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "common.h"
 #include "lists.h"
 
-struct lists_s_strs {
+struct lists_strs {
 	int size;          /* Number of strings on the list */
 	int capacity;      /* Number of allocated strings */
 	char **strs;
@@ -249,6 +250,7 @@ int lists_strs_tokenise (lists_t_strs *list, const char *s)
 
 /* Return the concatenation of all the strings in a list using the
  * given format for each, or NULL if the list is empty. */
+GCC_DIAG_OFF(format-nonliteral)
 char *lists_strs_fmt (const lists_t_strs *list, const char *fmt)
 {
 	int len, ix, rc;
@@ -276,6 +278,7 @@ char *lists_strs_fmt (const lists_t_strs *list, const char *fmt)
 
 	return result;
 }
+GCC_DIAG_ON(format-nonliteral)
 
 /* Return the concatenation of all the strings in a list, or NULL
  * if the list is empty. */
@@ -293,7 +296,7 @@ char *lists_strs_cat (const lists_t_strs *list)
 /* Return a "snapshot" of the given string list.  The returned memory is a
  * null-terminated list of pointers to the given list's strings copied into
  * memory allocated after the pointer list.  This list is suitable for passing
- * to functions which take such a list as an argument (e.g., evecv()).
+ * to functions which take such a list as an argument (e.g., execv()).
  * Invoking free() on the returned pointer also frees the strings. */
 char **lists_strs_save (const lists_t_strs *list)
 {
@@ -320,7 +323,7 @@ char **lists_strs_save (const lists_t_strs *list)
 
 /* Reload saved strings into a list.  The reloaded strings are appended
  * to the list.  The number of items reloaded is returned. */
-int lists_strs_load (lists_t_strs *list, char **saved)
+int lists_strs_load (lists_t_strs *list, const char **saved)
 {
 	int size;
 

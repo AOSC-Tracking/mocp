@@ -15,6 +15,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <assert.h>
@@ -25,7 +27,6 @@
 #include "files.h"
 #include "log.h"
 #include "io.h"
-#include "compat.h"
 #include "options.h"
 
 static struct plugin {
@@ -49,7 +50,7 @@ struct decoder_s_preference {
 	int decoders;                         /* number of decoders */
 	int decoder_list[PLUGINS_NUM];        /* decoder indices */
 	char *subtype;                        /* MIME subtype or NULL */
-	char type[FLEXIBLE_ARRAY_MEMBER];     /* MIME type or filename extn */
+	char type[];                          /* MIME type or filename extn */
 };
 typedef struct decoder_s_preference decoder_t_preference;
 static decoder_t_preference *preferences = NULL;
@@ -221,9 +222,30 @@ char *file_type_name (const char *file)
 		return NULL;
 
 	memset (buf, 0, sizeof (buf));
-	plugins[i].decoder->get_name (file, buf);
+	if (plugins[i].decoder->get_name)
+		plugins[i].decoder->get_name (file, buf);
 
-	assert (buf[0]);
+	/* Attempt a default name if we have nothing else. */
+	if (!buf[0]) {
+		char *ext;
+
+		ext = ext_pos (file);
+		if (ext) {
+			size_t len;
+
+			len = strlen (ext);
+			for (size_t ix = 0; ix < len; ix += 1) {
+				if (ix > 1) {
+					buf[2] = toupper (ext[len - 1]);
+					break;
+				}
+				buf[ix] = toupper (ext[ix]);
+			}
+		}
+	}
+
+	if (!buf[0])
+		return NULL;
 
 	return buf;
 }
@@ -418,7 +440,10 @@ static int lt_load_plugin (const char *file, lt_ptr debug_info_ptr)
 {
 	int debug_info;
 	const char *name;
-	plugin_init_func init_func;
+	union {
+		void *data;
+		plugin_init_func *func;
+	} init;
 
 	debug_info = *(int *)debug_info_ptr;
 	name = strrchr (file, '/');
@@ -446,15 +471,17 @@ static int lt_load_plugin (const char *file, lt_ptr debug_info_ptr)
 		return 0;
 	}
 
-	init_func = lt_dlsym (plugins[plugins_num].handle, "plugin_init");
-	if (!init_func) {
+	init.data = lt_dlsym (plugins[plugins_num].handle, "plugin_init");
+	if (!init.data) {
 		fprintf (stderr, "No init function in the plugin!\n");
 		if (lt_dlclose (plugins[plugins_num].handle))
 			fprintf (stderr, "Error unloading plugin: %s\n", lt_dlerror ());
 		return 0;
 	}
 
-	plugins[plugins_num].decoder = init_func ();
+	/* If this call to init.func() fails with memory access or illegal
+	 * instruction errors then read the commit log message for r2831. */
+	plugins[plugins_num].decoder = init.func ();
 	if (!plugins[plugins_num].decoder) {
 		fprintf (stderr, "NULL decoder!\n");
 		if (lt_dlclose (plugins[plugins_num].handle))
@@ -473,12 +500,11 @@ static int lt_load_plugin (const char *file, lt_ptr debug_info_ptr)
 
 	/* Is the Vorbis decoder using Tremor? */
 	if (!strcmp (plugins[plugins_num].name, "vorbis")) {
-		bool (*vorbis_is_tremor)();
+		void *vorbis_has_tremor;
 
-		vorbis_is_tremor = lt_dlsym (plugins[plugins_num].handle,
-		                             "vorbis_is_tremor");
-		if (vorbis_is_tremor)
-			have_tremor = vorbis_is_tremor ();
+		vorbis_has_tremor = lt_dlsym (plugins[plugins_num].handle,
+		                              "vorbis_has_tremor");
+		have_tremor = vorbis_has_tremor != NULL;
 	}
 
 	debug ("Loaded %s decoder", plugins[plugins_num].name);
@@ -724,7 +750,6 @@ void decoder_error (struct decoder_error *error,
 		const enum decoder_error_type type, const int add_errno,
 		const char *format, ...)
 {
-	char errno_buf[256] = "";
 	char *err_str;
 	va_list va;
 
@@ -737,10 +762,15 @@ void decoder_error (struct decoder_error *error,
 	err_str = format_msg_va (format, va);
 	va_end (va);
 
-	if (add_errno)
-		strerror_r(add_errno, errno_buf, sizeof(errno_buf));
+	if (add_errno) {
+		char *err_buf;
 
-	error->err = format_msg ("%s%s", err_str, errno_buf);
+		err_buf = xstrerror (add_errno);
+		error->err = format_msg ("%s%s", err_str, err_buf);
+		free (err_buf);
+	}
+	else
+		error->err = format_msg ("%s", err_str);
 
 	free (err_str);
 }

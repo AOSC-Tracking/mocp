@@ -9,8 +9,6 @@
  *
  */
 
-/*#define DEBUG*/
-
 /* Defining OUT_TEST causes the raw audio samples to be written
  * to the file 'out_test' in the current directory for debugging. */
 /*#define OUT_TEST*/
@@ -31,12 +29,42 @@
 #include <fcntl.h>
 #endif
 
+/*#define DEBUG*/
+
 #include "common.h"
 #include "audio.h"
 #include "log.h"
 #include "fifo_buf.h"
 #include "out_buf.h"
 #include "options.h"
+
+struct out_buf
+{
+	struct fifo_buf *buf;
+	pthread_mutex_t	mutex;
+	pthread_t tid;	/* Thread id of the reading thread. */
+
+	/* Signals. */
+	pthread_cond_t play_cond;	/* Something was written to the buffer. */
+	pthread_cond_t ready_cond;	/* There is some space in the buffer. */
+
+	/* Optional callback called when there is some free space in
+	 * the buffer. */
+	out_buf_free_callback *free_callback;
+
+	/* State flags of the buffer. */
+	int pause;
+	int exit;	/* Exit when the buffer is empty. */
+	int stop;	/* Don't play anything. */
+
+	int reset_dev;	/* Request to the reading thread to reset the audio
+			   device. */
+
+	float time;	/* Time of played sound. */
+	int hardware_buf_fill;	/* How the sound card buffer is filled. */
+
+	int read_thread_waiting; /* Is the read thread waiting for data? */
+};
 
 /* Don't play more than this value (in seconds) in one audio_play().
  * This prevents locking. */
@@ -52,13 +80,13 @@ static void set_realtime_prio ()
 #ifdef HAVE_SCHED_GET_PRIORITY_MAX
 	int rc;
 
-	if (options_get_int("UseRealtimePriority")) {
+	if (options_get_bool("UseRealtimePriority")) {
 		struct sched_param param;
 
 		param.sched_priority = sched_get_priority_max(SCHED_RR);
 		rc = pthread_setschedparam (pthread_self (), SCHED_RR, &param);
 		if (rc != 0)
-			logit ("Can't set realtime priority: %s", strerror (rc));
+			log_errno ("Can't set realtime priority", rc);
 	}
 #else
 	logit ("No sched_get_priority_max() function: "
@@ -90,7 +118,7 @@ static void *read_thread (void *arg)
 		}
 
 		if (buf->stop)
-			fifo_buf_clear (&buf->buf);
+			fifo_buf_clear (buf->buf);
 
 		if (buf->free_callback) {
 			/* unlock the mutex to make calls to out_buf functions
@@ -103,7 +131,7 @@ static void *read_thread (void *arg)
 		debug ("sending the signal");
 		pthread_cond_broadcast (&buf->ready_cond);
 
-		if ((fifo_buf_get_fill(&buf->buf) == 0 || buf->pause || buf->stop)
+		if ((fifo_buf_get_fill(buf->buf) == 0 || buf->pause || buf->stop)
 				&& !buf->exit) {
 			if (buf->pause && !audio_dev_closed) {
 				logit ("Closing the device due to pause");
@@ -123,13 +151,13 @@ static void *read_thread (void *arg)
 			logit ("Opening the device again after pause");
 			if (!audio_open(NULL)) {
 				logit ("Can't reopen the device! sleeping...");
-				sleep (1); /* there is no way to exit :( */
+				xsleep (1, 1); /* there is no way to exit :( */
 			}
 			else
 				audio_dev_closed = 0;
 		}
 
-		if (fifo_buf_get_fill(&buf->buf) == 0) {
+		if (fifo_buf_get_fill(buf->buf) == 0) {
 			if (buf->exit) {
 				logit ("exit");
 				break;
@@ -156,7 +184,7 @@ static void *read_thread (void *arg)
 			audio_bpf = audio_get_bpf();
 			play_buf_frames = MIN(audio_get_bps() * AUDIO_MAX_PLAY,
 			                      AUDIO_MAX_PLAY_BYTES) / audio_bpf;
-			play_buf_fill = fifo_buf_get(&buf->buf, play_buf,
+			play_buf_fill = fifo_buf_get(buf->buf, play_buf,
 			                             play_buf_frames * audio_bpf);
 			UNLOCK (buf->mutex);
 
@@ -192,15 +220,17 @@ static void *read_thread (void *arg)
 	return NULL;
 }
 
-/* Initialize the buf structure, size is the buffer size. */
-void out_buf_init (struct out_buf *buf, int size)
+/* Allocate and initialize the buf structure, size is the buffer size. */
+struct out_buf *out_buf_new (int size)
 {
 	int rc;
+	struct out_buf *buf;
 
-	assert (buf != NULL);
 	assert (size > 0);
 
-	fifo_buf_init (&buf->buf, size);
+	buf = xmalloc (sizeof (struct out_buf));
+
+	buf->buf = fifo_buf_new (size);
 	buf->exit = 0;
 	buf->pause = 0;
 	buf->stop = 0;
@@ -220,12 +250,14 @@ void out_buf_init (struct out_buf *buf, int size)
 
 	rc = pthread_create (&buf->tid, NULL, read_thread, buf);
 	if (rc != 0)
-		fatal ("Can't create buffer thread: %s", strerror (rc));
+		fatal ("Can't create buffer thread: %s", xstrerror (rc));
+
+	return buf;
 }
 
 /* Wait for empty buffer, end playing, free resources allocated for the buf
  * structure.  Can be used only if nothing is played. */
-void out_buf_destroy (struct out_buf *buf)
+void out_buf_free (struct out_buf *buf)
 {
 	int rc;
 
@@ -241,20 +273,23 @@ void out_buf_destroy (struct out_buf *buf)
 	/* Let other threads using this buffer know that the state of the
 	 * buffer has changed. */
 	LOCK (buf->mutex);
-	fifo_buf_clear (&buf->buf);
+	fifo_buf_clear (buf->buf);
 	pthread_cond_broadcast (&buf->ready_cond);
 	UNLOCK (buf->mutex);
 
-	fifo_buf_destroy (&buf->buf);
+	fifo_buf_free (buf->buf);
+	buf->buf = NULL;
 	rc = pthread_mutex_destroy (&buf->mutex);
 	if (rc != 0)
-		logit ("Destroying buffer mutex failed: %s", strerror (rc));
+		log_errno ("Destroying buffer mutex failed", rc);
 	rc = pthread_cond_destroy (&buf->play_cond);
 	if (rc != 0)
-		logit ("Destroying buffer play condition failed: %s", strerror (rc));
+		log_errno ("Destroying buffer play condition failed", rc);
 	rc = pthread_cond_destroy (&buf->ready_cond);
 	if (rc != 0)
-		logit ("Destroying buffer ready condition failed: %s", strerror (rc));
+		log_errno ("Destroying buffer ready condition failed", rc);
+
+	free (buf);
 
 	logit ("buffer destroyed");
 
@@ -275,7 +310,7 @@ int out_buf_put (struct out_buf *buf, const char *data, int size)
 
 		LOCK (buf->mutex);
 
-		if (fifo_buf_get_space(&buf->buf) == 0 && !buf->stop) {
+		if (fifo_buf_get_space(buf->buf) == 0 && !buf->stop) {
 			/*logit ("buffer full, waiting for the signal");*/
 			pthread_cond_wait (&buf->ready_cond, &buf->mutex);
 			/*logit ("buffer ready");*/
@@ -287,7 +322,7 @@ int out_buf_put (struct out_buf *buf, const char *data, int size)
 			return 0;
 		}
 
-		written = fifo_buf_put (&buf->buf, data + pos, size);
+		written = fifo_buf_put (buf->buf, data + pos, size);
 
 		if (written) {
 			pthread_cond_signal (&buf->play_cond);
@@ -341,7 +376,7 @@ void out_buf_reset (struct out_buf *buf)
 	logit ("resetting the buffer");
 
 	LOCK (buf->mutex);
-	fifo_buf_clear (&buf->buf);
+	fifo_buf_clear (buf->buf);
 	buf->stop = 0;
 	buf->pause = 0;
 	buf->reset_dev = 0;
@@ -390,7 +425,7 @@ int out_buf_get_free (struct out_buf *buf)
 	assert (buf != NULL);
 
 	LOCK (buf->mutex);
-	space = fifo_buf_get_space (&buf->buf);
+	space = fifo_buf_get_space (buf->buf);
 	UNLOCK (buf->mutex);
 
 	return space;
@@ -403,7 +438,7 @@ int out_buf_get_fill (struct out_buf *buf)
 	assert (buf != NULL);
 
 	LOCK (buf->mutex);
-	fill = fifo_buf_get_fill (&buf->buf);
+	fill = fifo_buf_get_fill (buf->buf);
 	UNLOCK (buf->mutex);
 
 	return fill;

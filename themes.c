@@ -13,11 +13,15 @@
 # include "config.h"
 #endif
 
-#ifdef HAVE_NCURSESW_H
+#if defined HAVE_NCURSESW_CURSES_H
 # include <ncursesw/curses.h>
-#elif HAVE_NCURSES_H
+#elif defined HAVE_NCURSESW_H
+# include <ncursesw.h>
+#elif defined HAVE_NCURSES_CURSES_H
+# include <ncurses/curses.h>
+#elif defined HAVE_NCURSES_H
 # include <ncurses.h>
-#elif HAVE_CURSES_H
+#elif defined HAVE_CURSES_H
 # include <curses.h>
 #endif
 
@@ -259,6 +263,7 @@ static int new_colordef (const int line_num, const char *name, const short red,
 /* Find path to the theme for the given name. Returned memory is static. */
 static char *find_theme_file (const char *name)
 {
+	int rc;
 	static char path[PATH_MAX];
 
 	path[sizeof(path)-1] = 0;
@@ -272,15 +277,16 @@ static char *find_theme_file (const char *name)
 	}
 
 	/* Try the user directory */
-	if (snprintf(path, sizeof(path), "%s/%s", create_file_name("themes"),
-				name) >= (int)sizeof(path))
+	rc = snprintf(path, sizeof(path), "%s/%s",
+	              create_file_name("themes"), name);
+	if (rc >= ssizeof(path))
 		interface_fatal ("Theme path too long!");
 	if (file_exists(path))
 		return path;
 
 	/* Try the system directory */
-	if (snprintf(path, sizeof(path), "%s/%s", SYSTEM_THEMES_DIR,
-				name) >= (int)sizeof(path))
+	rc = snprintf(path, sizeof(path), "%s/%s", SYSTEM_THEMES_DIR, name);
+	if (rc >= ssizeof(path))
 		interface_fatal ("Theme path too long!");
 	if (file_exists(path))
 		return path;
@@ -486,7 +492,7 @@ static int load_color_theme (const char *name, const int errors_are_fatal)
 
 	if (!(file = fopen(theme_file, "r"))) {
 		if (errors_are_fatal)
-			interface_fatal ("Can't open theme file: %s", strerror(errno));
+			interface_fatal ("Can't open theme file: %s", xstrerror (errno));
 		return 0;
 	}
 

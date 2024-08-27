@@ -38,7 +38,7 @@
 
 /* These merely silence compiler warnings about unused definitions in
  * the Vorbis library header files. */
-#if defined(HAVE__ATTRIBUTE__) && !defined(HAVE_TREMOR)
+#if defined(HAVE_VAR_ATTRIBUTE_UNUSED) && !defined(HAVE_TREMOR)
 static ov_callbacks *vorbis_unused[] ATTR_UNUSED = {
 	&OV_CALLBACKS_DEFAULT,
 	&OV_CALLBACKS_NOCLOSE,
@@ -140,7 +140,7 @@ static void vorbis_tags (const char *file_name, struct file_tags *info,
 	int err_code;
 
 	if (!(file = fopen (file_name, "r"))) {
-		logit ("Can't open an OGG file: %s", strerror(errno));
+		log_errno ("Can't open an OGG file", errno);
 		return;
 	}
 
@@ -171,8 +171,7 @@ static void vorbis_tags (const char *file_name, struct file_tags *info,
 	ov_clear (&vf);
 }
 
-static size_t read_callback (void *ptr, size_t size, size_t nmemb,
-		void *datasource)
+static size_t read_cb (void *ptr, size_t size, size_t nmemb, void *datasource)
 {
 	ssize_t res;
 
@@ -192,7 +191,7 @@ static size_t read_callback (void *ptr, size_t size, size_t nmemb,
 	return res;
 }
 
-static int seek_callback (void *datasource, ogg_int64_t offset, int whence)
+static int seek_cb (void *datasource, ogg_int64_t offset, int whence)
 {
 	debug ("Seek request to %"PRId64" (%s)", offset,
 			whence == SEEK_SET ? "SEEK_SET"
@@ -200,12 +199,12 @@ static int seek_callback (void *datasource, ogg_int64_t offset, int whence)
 	return io_seek (datasource, offset, whence) == -1 ? -1 : 0;
 }
 
-static int close_callback (void *datasource ATTR_UNUSED)
+static int close_cb (void *unused ATTR_UNUSED)
 {
 	return 0;
 }
 
-static long tell_callback (void *datasource)
+static long tell_cb (void *datasource)
 {
 	return (long)io_tell (datasource);
 }
@@ -214,21 +213,20 @@ static void vorbis_open_stream_internal (struct vorbis_data *data)
 {
 	int res;
 	ov_callbacks callbacks = {
-		read_callback,
-		seek_callback,
-		close_callback,
-		tell_callback
+		read_cb,
+		seek_cb,
+		close_cb,
+		tell_cb
 	};
 
 	data->tags = tags_new ();
 
-	if ((res = ov_open_callbacks(data->stream, &data->vf, NULL, 0,
-					callbacks)) < 0) {
+	res = ov_open_callbacks (data->stream, &data->vf, NULL, 0, callbacks);
+	if (res < 0) {
 		const char *vorbis_err = vorbis_strerror (res);
 
 		decoder_error (&data->error, ERROR_FATAL, 0, "%s", vorbis_err);
 		debug ("ov_open error: %s", vorbis_err);
-
 	}
 	else {
 		int64_t duration;
@@ -421,7 +419,7 @@ static struct io_stream *vorbis_get_stream (void *prv_data)
 	return data->stream;
 }
 
-static void vorbis_get_name (const char *file ATTR_UNUSED, char buf[4])
+static void vorbis_get_name (const char *unused ATTR_UNUSED, char buf[4])
 {
 	strcpy (buf, "OGG");
 }
@@ -474,15 +472,10 @@ struct decoder *plugin_init ()
 	return &vorbis_decoder;
 }
 
-/* Return true if the Vorbis decoder is using Tremor, otherwise false.
- * This is used by the decoder plugin loader so it can document which
- * library is being used without requiring the decoder and the loader
- * be built with the same HAVE_TREMOR setting. */
-bool vorbis_is_tremor ()
-{
+/* Defined and true if the Vorbis decoder is using Tremor, otherwise
+ * undefined.  This is used by the decoder plugin loader so it can
+ * document which library is being used without requiring the decoder
+ * and the loader be built with the same HAVE_TREMOR setting. */
 #ifdef HAVE_TREMOR
-	return true;
-#else
-	return false;
+const bool vorbis_has_tremor = true;
 #endif
-}

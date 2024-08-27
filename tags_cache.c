@@ -23,19 +23,17 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #ifdef HAVE_DB_H
-#include <db.h>
-#endif
-
-/* Include dirent for various systems */
-#ifdef HAVE_DIRENT_H
-# include <dirent.h>
-#else
-# define dirent direct
-# if HAVE_SYS_NDIR_H
-#  include <sys/ndir.h>
+# ifndef HAVE_U_INT
+typedef unsigned char u_char;
+typedef unsigned short u_short;
+typedef unsigned int u_int;
+typedef unsigned long int u_long;
 # endif
+# include <db.h>
+# define STRERROR_FN bdb_strerror
 #endif
 
 #define DEBUG
@@ -48,6 +46,12 @@
 #include "tags_cache.h"
 #include "log.h"
 #include "audio.h"
+
+#ifdef HAVE_DB_H
+# define DB_ONLY
+#else
+# define DB_ONLY ATTR_UNUSED
+#endif
 
 /* The name of the tags database in the cache directory. */
 #define TAGS_DB "tags.db"
@@ -79,12 +83,54 @@ struct request_queue_node
 	int tags_sel; /* which tags to read (TAGS_*) */
 };
 
+struct request_queue
+{
+	struct request_queue_node *head;
+	struct request_queue_node *tail;
+};
+
+struct tags_cache
+{
+	/* BerkeleyDB's stuff for storing cache. */
+#ifdef HAVE_DB_H
+	DB_ENV *db_env;
+	DB *db;
+	u_int32_t locker;
+#endif
+
+	int max_items;		/* maximum number of items in the cache. */
+	struct request_queue queues[CLIENTS_MAX]; /* requests queues for each
+						     client */
+	int stop_reader_thread; /* request for stopping read thread (if
+				   non-zero) */
+	pthread_cond_t request_cond; /* condition for signalizing new
+					requests */
+	pthread_mutex_t mutex; /* mutex for all above data (except db because
+				  it's thread-safe) */
+	pthread_t reader_thread; /* tid of the reading thread */
+};
+
 struct cache_record
 {
 	time_t mod_time;		/* last modification time of the file */
 	time_t atime;			/* Time of last access. */
 	struct file_tags *tags;
 };
+
+/* BerkleyDB-provided error code to description function wrapper. */
+#ifdef HAVE_DB_H
+static inline char *bdb_strerror (int errnum)
+{
+	char *result;
+
+	if (errnum > 0)
+		result = xstrerror (errnum);
+	else
+		result = xstrdup (db_strerror (errnum));
+
+	return result;
+}
+#endif
 
 static void request_queue_init (struct request_queue *q)
 {
@@ -273,24 +319,28 @@ static int cache_record_deserialize (struct cache_record *rec,
 	else
 		rec->tags = NULL;
 
-#define extract_num(var)			\
-	if (bytes_left < sizeof(var))		\
-		goto err;			\
-	memcpy (&var, p, sizeof(var));		\
-	bytes_left -= sizeof(var);		\
-	p += sizeof(var);
+#define extract_num(var) \
+	do { \
+		if (bytes_left < sizeof(var)) \
+			goto err; \
+		memcpy (&var, p, sizeof(var)); \
+		bytes_left -= sizeof(var); \
+		p += sizeof(var); \
+	} while (0)
 
-#define extract_str(var)			\
-	if (bytes_left < sizeof(str_len))	\
-		goto err;			\
-	memcpy (&str_len, p, sizeof(str_len));	\
-	p += sizeof(str_len);			\
-	if (bytes_left < str_len)		\
-		goto err;			\
-	var = xmalloc (str_len + 1);		\
-	memcpy (var, p, str_len);		\
-	var[str_len] = '\0';			\
-	p += str_len;
+#define extract_str(var) \
+	do { \
+		if (bytes_left < sizeof(str_len)) \
+			goto err; \
+		memcpy (&str_len, p, sizeof(str_len)); \
+		p += sizeof(str_len); \
+		if (bytes_left < str_len) \
+			goto err; \
+		var = xmalloc (str_len + 1); \
+		memcpy (var, p, str_len); \
+		var[str_len] = '\0'; \
+		p += str_len; \
+	} while (0)
 
 	extract_num (rec->mod_time);
 	extract_num (rec->atime);
@@ -390,8 +440,8 @@ static void tags_cache_remove_rec (struct tags_cache *c, const char *fname)
 
 	ret = c->db->del (c->db, NULL, &key, 0);
 	if (ret)
-		logit ("Can't remove item for %s from the cache: %s", fname,
-				db_strerror (ret));
+		logit ("Can't remove item for %s from the cache: %s",
+				fname, db_strerror (ret));
 }
 #endif
 
@@ -448,8 +498,7 @@ static void tags_cache_gc (struct tags_cache *c)
 	}
 
 	if (ret != DB_NOTFOUND)
-		logit ("Searching for element to remove failed (cursor): %s",
-				db_strerror (ret));
+		log_errno ("Searching for element to remove failed (cursor)", ret);
 
 #if DB_VERSION_MAJOR == 4 && DB_VERSION_MINOR < 6
 	cur->c_close (cur);
@@ -517,7 +566,7 @@ static void tags_cache_add (struct tags_cache *c, const char *file,
 
 	ret = c->db->put (c->db, NULL, key, &data, 0);
 	if (ret)
-		error ("DB put error: %s", db_strerror (ret));
+		error_errno ("DB put error", ret);
 
 	tags_cache_sync (c);
 
@@ -563,7 +612,7 @@ static void *locked_read_add (struct tags_cache *c, const char *file,
 
 	ret = c->db->get (c->db, NULL, key, serialized_cache_rec, 0);
 	if (ret && ret != DB_NOTFOUND)
-		logit ("Cache DB get error: %s", db_strerror (ret));
+		log_errno ("Cache DB get error", ret);
 
 	/* If this entry is already present in the cache, we have 3 options:
 	 * we must read different tags (TAGS_*) or the tags are outdated
@@ -601,7 +650,7 @@ static void *locked_read_add (struct tags_cache *c, const char *file,
 /* Read the selected tags for this file and add it to the cache.
  * If client_id != -1, the server is notified using tags_response().
  * If client_id == -1, copy of file_tags is returned. */
-static struct file_tags *tags_cache_read_add (struct tags_cache *c ATTR_UNUSED,
+static struct file_tags *tags_cache_read_add (struct tags_cache *c DB_ONLY,
                      const char *file, int tags_sel, int client_id)
 {
 	struct file_tags *tags = NULL;
@@ -685,38 +734,41 @@ static void *reader_thread (void *cache_ptr)
 	return NULL;
 }
 
-void tags_cache_init (struct tags_cache *c, size_t max_size)
+struct tags_cache *tags_cache_new (size_t max_size)
 {
 	int i, rc;
+	struct tags_cache *result;
 
-	assert (c != NULL);
+	result = (struct tags_cache *)xmalloc (sizeof (struct tags_cache));
 
 #ifdef HAVE_DB_H
-	c->db_env = NULL;
-	c->db = NULL;
+	result->db_env = NULL;
+	result->db = NULL;
 #endif
 
 	for (i = 0; i < CLIENTS_MAX; i++)
-		request_queue_init (&c->queues[i]);
+		request_queue_init (&result->queues[i]);
 
 #if CACHE_DB_FORMAT_VERSION
-	c->max_items = max_size;
+	result->max_items = max_size;
 #else
-	c->max_items = 0;
+	result->max_items = 0;
 #endif
-	c->stop_reader_thread = 0;
-	pthread_mutex_init (&c->mutex, NULL);
+	result->stop_reader_thread = 0;
+	pthread_mutex_init (&result->mutex, NULL);
 
-	rc = pthread_cond_init (&c->request_cond, NULL);
+	rc = pthread_cond_init (&result->request_cond, NULL);
 	if (rc != 0)
-		fatal ("Can't create request_cond: %s", strerror (rc));
+		fatal ("Can't create request_cond: %s", xstrerror (rc));
 
-	rc = pthread_create (&c->reader_thread, NULL, reader_thread, c);
+	rc = pthread_create (&result->reader_thread, NULL, reader_thread, result);
 	if (rc != 0)
-		fatal ("Can't create tags cache thread: %s", strerror (rc));
+		fatal ("Can't create tags cache thread: %s", xstrerror (rc));
+
+	return result;
 }
 
-void tags_cache_destroy (struct tags_cache *c)
+void tags_cache_free (struct tags_cache *c)
 {
 	int i, rc;
 
@@ -729,9 +781,11 @@ void tags_cache_destroy (struct tags_cache *c)
 
 #ifdef HAVE_DB_H
 	if (c->db) {
+#ifndef NDEBUG
 		c->db->set_errcall (c->db, NULL);
 		c->db->set_msgcall (c->db, NULL);
 		c->db->set_paniccall (c->db, NULL);
+#endif
 		c->db->close (c->db, 0);
 		c->db = NULL;
 	}
@@ -740,9 +794,11 @@ void tags_cache_destroy (struct tags_cache *c)
 #ifdef HAVE_DB_H
 	if (c->db_env) {
 		c->db_env->lock_id_free (c->db_env, c->locker);
+#ifndef NDEBUG
 		c->db_env->set_errcall (c->db_env, NULL);
 		c->db_env->set_msgcall (c->db_env, NULL);
 		c->db_env->set_paniccall (c->db_env, NULL);
+#endif
 		c->db_env->close (c->db_env, 0);
 		c->db_env = NULL;
 	}
@@ -751,17 +807,19 @@ void tags_cache_destroy (struct tags_cache *c)
 	rc = pthread_join (c->reader_thread, NULL);
 	if (rc != 0)
 		fatal ("pthread_join() on cache reader thread failed: %s",
-		        strerror (rc));
+		        xstrerror (rc));
 
 	for (i = 0; i < CLIENTS_MAX; i++)
 		request_queue_clear (&c->queues[i]);
 
 	rc = pthread_mutex_destroy (&c->mutex);
 	if (rc != 0)
-		logit ("Can't destroy mutex: %s", strerror (rc));
+		log_errno ("Can't destroy mutex", rc);
 	rc = pthread_cond_destroy (&c->request_cond);
 	if (rc != 0)
-		logit ("Can't destroy request_cond: %s", strerror (rc));
+		log_errno ("Can't destroy request_cond", rc);
+
+	free (c);
 }
 
 #ifdef HAVE_DB_H
@@ -780,7 +838,7 @@ static void *locked_add_request (struct tags_cache *c, const char *file,
 		return NULL;
 
 	if (db_ret) {
-		error ("Cache DB search error: %s", db_strerror (db_ret));
+		error_errno ("Cache DB search error", db_ret);
 		return NULL;
 	}
 
@@ -853,18 +911,9 @@ void tags_cache_clear_up_to (struct tags_cache *c, const char *file,
 	UNLOCK (c->mutex);
 }
 
-void tags_cache_save (struct tags_cache *c ATTR_UNUSED,
-                      const char *cache_dir ATTR_UNUSED)
-{
-	//TODO: to remove
-
-	assert (c != NULL);
-	assert (cache_dir != NULL);
-}
-
-#ifdef HAVE_DB_H
-static void db_err_cb (const DB_ENV *dbenv ATTR_UNUSED, const char *errpfx,
-                                                        const char *msg)
+#if defined(HAVE_DB_H) && !defined(NDEBUG)
+static void db_err_cb (const DB_ENV *unused ATTR_UNUSED, const char *errpfx,
+                                                         const char *msg)
 {
 	assert (msg);
 
@@ -875,8 +924,8 @@ static void db_err_cb (const DB_ENV *dbenv ATTR_UNUSED, const char *errpfx,
 }
 #endif
 
-#ifdef HAVE_DB_H
-static void db_msg_cb (const DB_ENV *dbenv ATTR_UNUSED, const char *msg)
+#if defined(HAVE_DB_H) && !defined(NDEBUG)
+static void db_msg_cb (const DB_ENV *unused ATTR_UNUSED, const char *msg)
 {
 	assert (msg);
 
@@ -884,10 +933,10 @@ static void db_msg_cb (const DB_ENV *dbenv ATTR_UNUSED, const char *msg)
 }
 #endif
 
-#ifdef HAVE_DB_H
-static void db_panic_cb (DB_ENV *dbenv ATTR_UNUSED, int errval)
+#if defined(HAVE_DB_H) && !defined(NDEBUG)
+static void db_panic_cb (DB_ENV *unused ATTR_UNUSED, int errval)
 {
-	logit ("BDB said: %s", db_strerror (errval));
+	log_errno ("BDB said", errval);
 }
 #endif
 
@@ -902,7 +951,9 @@ static int purge_directory (const char *dir_path)
 
 	dir = opendir (dir_path);
 	if (!dir) {
-		logit ("Can't open directory %s: %s", dir_path, strerror (errno));
+		char *err = xstrerror (errno);
+		logit ("Can't open directory %s: %s", dir_path, err);
+		free (err);
 		return 0;
 	}
 
@@ -919,7 +970,9 @@ static int purge_directory (const char *dir_path)
 		snprintf (fpath, len, "%s/%s", dir_path, d->d_name);
 
 		if (stat (fpath, &st) < 0) {
-			logit ("Can't stat %s: %s", fpath, strerror (errno));
+			char *err = xstrerror (errno);
+			logit ("Can't stat %s: %s", fpath, err);
+			free (err);
 			free (fpath);
 			closedir (dir);
 			return 0;
@@ -934,7 +987,9 @@ static int purge_directory (const char *dir_path)
 
 			logit ("Removing directory %s...", fpath);
 			if (rmdir (fpath) < 0) {
-				logit ("Can't remove %s: %s", fpath, strerror (errno));
+				char *err = xstrerror (errno);
+				logit ("Can't remove %s: %s", fpath, err);
+				free (err);
 				free (fpath);
 				closedir (dir);
 				return 0;
@@ -944,7 +999,9 @@ static int purge_directory (const char *dir_path)
 			logit ("Removing file %s...", fpath);
 
 			if (unlink (fpath) < 0) {
-				logit ("Can't remove %s: %s", fpath, strerror (errno));
+				char *err = xstrerror (errno);
+				logit ("Can't remove %s: %s", fpath, err);
+				free (err);
 				free (fpath);
 				closedir (dir);
 				return 0;
@@ -956,41 +1013,6 @@ static int purge_directory (const char *dir_path)
 
 	closedir (dir);
 	return 1;
-}
-#endif
-
-/* Remove the old Berkley DB backing files from the cache directory. */
-#ifdef HAVE_DB_H
-static void vacuum_old_db_files (const char *dir_path)
-{
-	DIR *dir;
-	struct dirent *d;
-
-	dir = opendir (dir_path);
-	if (!dir) {
-		logit ("Can't open directory %s: %s", dir_path, strerror (errno));
-		return;
-	}
-
-	while ((d = readdir (dir))) {
-		if (!strncmp (d->d_name, "__db.", 5)) {
-			char *fpath;
-			int len;
-
-			len = strlen (dir_path) + strlen (d->d_name) + 2;
-			fpath = (char *)xmalloc (len);
-			snprintf (fpath, len, "%s/%s", dir_path, d->d_name);
-
-			logit ("Vacuuming file: %s", fpath);
-
-			if (unlink (fpath) < 0)
-				logit ("Can't remove %s: %s", fpath, strerror (errno));
-
-			free (fpath);
-		}
-	}
-
-	closedir (dir);
 }
 #endif
 
@@ -1085,7 +1107,7 @@ static void write_cache_version (const char *cache_dir)
 
 	f = fopen (fname, "w");
 	if (!f) {
-		logit ("Error opening cache: %s", strerror (errno));
+		log_errno ("Error opening cache", errno);
 		free (fname);
 		return;
 	}
@@ -1110,8 +1132,7 @@ static int prepare_cache_dir (const char *cache_dir)
 	}
 
 	if (errno != EEXIST) {
-		error ("Failed to create directory for tags cache: %s",
-				strerror (errno));
+		error_errno ("Failed to create directory for tags cache", errno);
 		return 0;
 	}
 
@@ -1122,14 +1143,13 @@ static int prepare_cache_dir (const char *cache_dir)
 			return 0;
 		write_cache_version (cache_dir);
 	}
-	else
-		vacuum_old_db_files (cache_dir);
 
 	return 1;
 }
 #endif
 
-void tags_cache_load (struct tags_cache *c, const char *cache_dir)
+void tags_cache_load (struct tags_cache *c DB_ONLY,
+                      const char *cache_dir DB_ONLY)
 {
 	assert (c != NULL);
 	assert (cache_dir != NULL);
@@ -1147,15 +1167,17 @@ void tags_cache_load (struct tags_cache *c, const char *cache_dir)
 
 	ret = db_env_create (&c->db_env, 0);
 	if (ret) {
-		error ("Can't create DB environment: %s", db_strerror (ret));
+		error_errno ("Can't create DB environment", ret);
 		goto err;
 	}
 
+#ifndef NDEBUG
 	c->db_env->set_errcall (c->db_env, db_err_cb);
 	c->db_env->set_msgcall (c->db_env, db_msg_cb);
 	ret = c->db_env->set_paniccall (c->db_env, db_panic_cb);
 	if (ret)
 		logit ("Could not set DB panic callback");
+#endif
 
 	ret = c->db_env->open (c->db_env, cache_dir,
 	                       DB_CREATE | DB_PRIVATE | DB_INIT_MPOOL |
@@ -1168,27 +1190,28 @@ void tags_cache_load (struct tags_cache *c, const char *cache_dir)
 
 	ret = c->db_env->lock_id (c->db_env, &c->locker);
 	if (ret) {
-		error ("Failed to get DB locker: %s", db_strerror (ret));
+		error_errno ("Failed to get DB locker", ret);
 		goto err;
 	}
 
 	ret = db_create (&c->db, c->db_env, 0);
 	if (ret) {
-		error ("Failed to create cache db: %s", db_strerror (ret));
+		error_errno ("Failed to create cache db", ret);
 		goto err;
 	}
 
+#ifndef NDEBUG
 	c->db->set_errcall (c->db, db_err_cb);
 	c->db->set_msgcall (c->db, db_msg_cb);
 	ret = c->db->set_paniccall (c->db, db_panic_cb);
 	if (ret)
 		logit ("Could not set DB panic callback");
+#endif
 
 	ret = c->db->open (c->db, NULL, TAGS_DB, NULL, DB_BTREE,
 	                                DB_CREATE | DB_THREAD, 0);
 	if (ret) {
-		error ("Failed to open (or create) tags cache db: %s",
-		        db_strerror (ret));
+		error_errno ("Failed to open (or create) tags cache db", ret);
 		goto err;
 	}
 
@@ -1196,16 +1219,20 @@ void tags_cache_load (struct tags_cache *c, const char *cache_dir)
 
 err:
 	if (c->db) {
+#ifndef NDEBUG
 		c->db->set_errcall (c->db, NULL);
 		c->db->set_msgcall (c->db, NULL);
 		c->db->set_paniccall (c->db, NULL);
+#endif
 		c->db->close (c->db, 0);
 		c->db = NULL;
 	}
 	if (c->db_env) {
+#ifndef NDEBUG
 		c->db_env->set_errcall (c->db_env, NULL);
 		c->db_env->set_msgcall (c->db_env, NULL);
 		c->db_env->set_paniccall (c->db_env, NULL);
+#endif
 		c->db_env->close (c->db_env, 0);
 		c->db_env = NULL;
 	}

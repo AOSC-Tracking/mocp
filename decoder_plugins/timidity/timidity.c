@@ -18,8 +18,8 @@
 #include "config.h"
 #endif
 
-#include <ctype.h> // for toupper
 #include <string.h>
+#include <strings.h>
 #include <assert.h>
 #include <timidity.h>
 
@@ -142,10 +142,10 @@ static int timidity_decode (void *void_data, char *buf, int buf_len,
   sound_params->rate = midioptions.rate;
   sound_params->fmt = (midioptions.format==MID_AUDIO_S16LSB)?(SFMT_S16 | SFMT_LE):SFMT_S8;
 
-  return mid_song_read_wave(data->midisong, buf, buf_len);
+  return mid_song_read_wave(data->midisong, (void *)buf, buf_len);
 }
 
-static int timidity_get_bitrate (void *void_data ATTR_UNUSED)
+static int timidity_get_bitrate (void *unused ATTR_UNUSED)
 {
   return -1;
 }
@@ -156,7 +156,7 @@ static int timidity_get_duration (void *void_data)
   return data->length/1000;
 }
 
-static void timidity_get_name (const char *file ATTR_UNUSED, char buf[4])
+static void timidity_get_name (const char *unused ATTR_UNUSED, char buf[4])
 {
   strcpy (buf, "MID");
 }
