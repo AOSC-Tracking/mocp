@@ -381,6 +381,8 @@ dnl Decoder plugins
 m4_include(decoder_plugins/decoders.m4)
 
 dnl Require with iconv for charset translation.
+AM_GNU_GETTEXT([external])
+AM_GNU_GETTEXT_VERSION(0.25)
 AM_ICONV
 if test "x$am_cv_func_iconv" != xyes; then
 	AC_MSG_ERROR([No iconv library found.])
